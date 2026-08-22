@@ -5,6 +5,10 @@
 #include "AsyncTCPLogging.h"
 #include "AsyncTCPSimpleIntrusiveList.h"
 
+#if ASYNC_TCP_SSL_ENABLED
+#include "AsyncTCP_TLS_Context.h"
+#endif
+
 /**
  * LibreTiny specific configurations
  */
@@ -777,6 +781,17 @@ AsyncClient::AsyncClient(tcp_pcb *pcb)
     _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true), _tx_last_packet(0),
     _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
   _pcb = pcb;
+#if ASYNC_TCP_SSL_ENABLED
+  _ssl_ctx = 0;
+  _ssl_handshake_done = false;
+  _ssl_timeout = SSL_HANDSHAKE_TIMEOUT;
+  _ssl_ca_cert = 0;
+  _ssl_ca_cert_len = 0;
+  _ssl_client_cert = 0;
+  _ssl_client_cert_len = 0;
+  _ssl_client_key = 0;
+  _ssl_client_key_len = 0;
+#endif
   if (_pcb) {
     _rx_last_packet = millis();
     _bind_tcp_callbacks(_pcb, this);
@@ -784,6 +799,12 @@ AsyncClient::AsyncClient(tcp_pcb *pcb)
 }
 
 AsyncClient::~AsyncClient() {
+#if ASYNC_TCP_SSL_ENABLED
+  if (_ssl_ctx) {
+    delete _ssl_ctx;
+    _ssl_ctx = 0;
+  }
+#endif
   if (_pcb) {
     _close();
   }
@@ -937,6 +958,76 @@ bool AsyncClient::connect(const char *host, uint16_t port) {
   return false;
 }
 
+#if ASYNC_TCP_SSL_ENABLED
+bool AsyncClient::beginSecure(const char *host, uint16_t port, const char *rootCA,
+    const char *clientCert, const char *clientKey) {
+  return beginSecure(host, port,
+      (const unsigned char *)rootCA, (rootCA != NULL) ? strlen(rootCA) + 1 : 0,
+      (const unsigned char *)clientCert, (clientCert != NULL) ? strlen(clientCert) + 1 : 0,
+      (const unsigned char *)clientKey, (clientKey != NULL) ? strlen(clientKey) + 1 : 0);
+}
+
+bool AsyncClient::beginSecure(const char *host, uint16_t port,
+    const unsigned char *rootCA, size_t rootCALen,
+    const unsigned char *clientCert, size_t clientCertLen,
+    const unsigned char *clientKey, size_t clientKeyLen) {
+  if (_ssl_ctx) {
+    async_tcp_log_d("already have SSL context");
+    return false;
+  }
+  // Store SSL parameters — handshake will run in _connected() after TCP completes
+  _ssl_host = String(host);
+  _ssl_ca_cert = rootCA;
+  _ssl_ca_cert_len = rootCALen;
+  _ssl_client_cert = clientCert;
+  _ssl_client_cert_len = clientCertLen;
+  _ssl_client_key = clientKey;
+  _ssl_client_key_len = clientKeyLen;
+  return connect(host, port);
+}
+
+void AsyncClient::feedSSLRxData(const unsigned char *data, size_t len) {
+  if (_ssl_ctx) {
+    _ssl_ctx->feedRxData(data, len);
+  }
+}
+
+size_t AsyncClient::flushSSLTxData() {
+  if (_ssl_ctx) {
+    return _ssl_ctx->flushTxData();
+  }
+  return 0;
+}
+
+bool AsyncClient::hasSSLRxData() const {
+  if (_ssl_ctx) {
+    return _ssl_ctx->hasRxData();
+  }
+  return false;
+}
+
+int AsyncClient::sslRead(uint8_t *data, size_t len) {
+  if (_ssl_ctx) {
+    return _ssl_ctx->read(data, len);
+  }
+  return -1;
+}
+
+int AsyncClient::sslWrite(const uint8_t *data, size_t len) {
+  if (_ssl_ctx) {
+    return _ssl_ctx->write(data, len);
+  }
+  return -1;
+}
+
+int AsyncClient::runSSLHandshake() {
+  if (_ssl_ctx) {
+    return _ssl_ctx->runSSLHandshake();
+  }
+  return -1;
+}
+#endif
+
 void AsyncClient::close() {
   if (_pcb) {
     _tcp_recved(&_pcb, _rx_ack_len);
@@ -967,6 +1058,16 @@ size_t AsyncClient::add(const char *data, size_t size, uint8_t apiflags) {
   if (!_pcb || size == 0 || data == NULL) {
     return 0;
   }
+#if ASYNC_TCP_SSL_ENABLED
+  if (_ssl_ctx && _ssl_handshake_done) {
+    // SSL: encrypt via mbedtls, which calls BIO send -> tcp_write
+    int ret = _ssl_ctx->write((const uint8_t *)data, size);
+    if (ret > 0) {
+      return (size_t)ret;
+    }
+    return 0;
+  }
+#endif
   size_t room = space();
   if (!room) {
     return 0;
@@ -1015,6 +1116,13 @@ void AsyncClient::ackPacket(struct pbuf *pb) {
 
 int8_t AsyncClient::_close() {
   // ets_printf("X: 0x%08x\n", (uint32_t)this);
+#if ASYNC_TCP_SSL_ENABLED
+  if (_ssl_ctx) {
+    delete _ssl_ctx;
+    _ssl_ctx = 0;
+    _ssl_handshake_done = false;
+  }
+#endif
   int8_t err = _tcp_close(&_pcb, this);
   // _pcb is now NULL
   if ((err == ERR_OK) && _discard_cb) {
@@ -1035,6 +1143,59 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
   }
   _tx_last_packet = 0;
   _rx_last_ack = 0;
+
+#if ASYNC_TCP_SSL_ENABLED
+  if (_ssl_host.length() > 0 && !_ssl_ctx) {
+    // Create SSL context and start handshake
+    _ssl_ctx = new (std::nothrow) AsyncTCP_TLS_Context();
+    if (!_ssl_ctx) {
+      async_tcp_log_e("failed to allocate SSL context");
+      if (_error_cb) {
+        _error_cb(_error_cb_arg, this, -60);
+      }
+      if (_discard_cb) {
+        _discard_cb(_discard_cb_arg, this);
+      }
+      return ERR_ABRT;
+    }
+    int ret = _ssl_ctx->startSSLClient(_pcb, _ssl_host.c_str(),
+        _ssl_ca_cert, _ssl_ca_cert_len,
+        _ssl_client_cert, _ssl_client_cert_len,
+        _ssl_client_key, _ssl_client_key_len);
+    if (ret != 0) {
+      async_tcp_log_e("startSSLClient failed: %d", ret);
+      delete _ssl_ctx;
+      _ssl_ctx = 0;
+      if (_error_cb) {
+        _error_cb(_error_cb_arg, this, -60);
+      }
+      if (_discard_cb) {
+        _discard_cb(_discard_cb_arg, this);
+      }
+      return ERR_ABRT;
+    }
+  }
+
+  if (_ssl_ctx) {
+    int ret = _ssl_ctx->runSSLHandshake();
+    if (ret != 0) {
+      if (ret < 0 && ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+        async_tcp_log_e("SSL handshake failed: %d", ret);
+        if (_error_cb) {
+          _error_cb(_error_cb_arg, this, -60);
+        }
+        if (_discard_cb) {
+          _discard_cb(_discard_cb_arg, this);
+        }
+        return ERR_ABRT;
+      }
+      return ERR_OK;
+    }
+    _ssl_handshake_done = true;
+    async_tcp_log_d("SSL handshake completed");
+  }
+#endif
+
   if (_connect_cb) {
     async_tcp_log_elapsed("onConnect", _connect_cb(_connect_cb_arg, this));
   }
@@ -1066,6 +1227,13 @@ int8_t AsyncClient::_lwip_fin(tcp_pcb *pcb, int8_t err) {
 
 // In Async Thread
 int8_t AsyncClient::_fin(tcp_pcb *pcb, int8_t err) {
+#if ASYNC_TCP_SSL_ENABLED
+  if (_ssl_ctx) {
+    delete _ssl_ctx;
+    _ssl_ctx = 0;
+    _ssl_handshake_done = false;
+  }
+#endif
   close();
   return ERR_OK;
 }
@@ -1079,6 +1247,73 @@ int8_t AsyncClient::_sent(tcp_pcb *pcb, uint16_t len) {
 }
 
 int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
+#if ASYNC_TCP_SSL_ENABLED
+  if (_ssl_ctx && !_ssl_handshake_done) {
+    // During handshake: feed all received data into SSL rx buffer
+    while (pb != NULL) {
+      _rx_last_packet = millis();
+      pbuf *b = pb;
+      pb = b->next;
+      b->next = NULL;
+      _ssl_ctx->feedRxData((const unsigned char *)b->payload, b->len);
+      if (_pcb) {
+        _tcp_recved(&_pcb, b->len);
+      }
+      pbuf_free(b);
+    }
+    // Try to continue handshake
+    int ret = _ssl_ctx->runSSLHandshake();
+    if (ret == 0) {
+      _ssl_handshake_done = true;
+      async_tcp_log_d("SSL handshake completed (from _recv)");
+      if (_connect_cb) {
+        async_tcp_log_elapsed("onConnect", _connect_cb(_connect_cb_arg, this));
+      }
+    } else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      // Still in progress, wait for more data
+    } else {
+      async_tcp_log_e("SSL handshake failed in _recv: %d", ret);
+      if (_error_cb) {
+        _error_cb(_error_cb_arg, this, -60);
+      }
+      if (_discard_cb) {
+        _discard_cb(_discard_cb_arg, this);
+      }
+    }
+    return ERR_OK;
+  }
+
+  if (_ssl_ctx && _ssl_handshake_done) {
+    // SSL established: feed encrypted data, decrypt, deliver plaintext
+    while (pb != NULL) {
+      _rx_last_packet = millis();
+      pbuf *b = pb;
+      pb = b->next;
+      b->next = NULL;
+      _ssl_ctx->feedRxData((const unsigned char *)b->payload, b->len);
+      // Ack data to TCP immediately — it's now buffered in the SSL context
+      if (_pcb) {
+        _tcp_recved(&_pcb, b->len);
+      }
+      pbuf_free(b);
+    }
+    // Decrypt all available plaintext
+    _ack_pcb = true;
+    uint8_t buf[256];
+    int n;
+    while ((n = _ssl_ctx->read(buf, sizeof(buf))) > 0) {
+      if (_recv_cb) {
+        async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, buf, n));
+      }
+      if (!_ack_pcb) {
+        _rx_ack_len += n;
+      }
+    }
+    return ERR_OK;
+  }
+#endif
+
+  // Non-SSL path (original code)
   while (pb != NULL) {
     _rx_last_packet = millis();
     // we should not ack before we assimilate the data
@@ -1114,6 +1349,35 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
   }
 
   uint32_t now = millis();
+
+#if ASYNC_TCP_SSL_ENABLED
+  // SSL handshake in progress — continue it
+  if (_ssl_ctx && !_ssl_handshake_done) {
+    if ((now - _rx_last_packet) > _ssl_timeout) {
+      async_tcp_log_e("SSL handshake timeout");
+      if (_error_cb) {
+        _error_cb(_error_cb_arg, this, -61);
+      }
+      _close();
+      return ERR_OK;
+    }
+    int ret = _ssl_ctx->runSSLHandshake();
+    if (ret == 0) {
+      _ssl_handshake_done = true;
+      async_tcp_log_d("SSL handshake completed (from _poll)");
+      if (_connect_cb) {
+        async_tcp_log_elapsed("onConnect", _connect_cb(_connect_cb_arg, this));
+      }
+    } else if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+      async_tcp_log_e("SSL handshake failed in _poll: %d", ret);
+      if (_error_cb) {
+        _error_cb(_error_cb_arg, this, -60);
+      }
+      _close();
+    }
+    return ERR_OK;
+  }
+#endif
 
   // ACK Timeout
   if (_ack_timeout) {
@@ -1168,6 +1432,16 @@ bool AsyncClient::free() {
 }
 
 size_t AsyncClient::write(const char *data, size_t size, uint8_t apiflags) {
+#if ASYNC_TCP_SSL_ENABLED
+  if (_ssl_ctx && _ssl_handshake_done) {
+    int ret = _ssl_ctx->write((const uint8_t *)data, size);
+    if (ret > 0) {
+      _tx_last_packet = millis();
+      return (size_t)ret;
+    }
+    return 0;
+  }
+#endif
   size_t will_send = add(data, size, apiflags);
   if (!will_send || !send()) {
     return 0;
@@ -1442,6 +1716,8 @@ const char *AsyncClient::errorToString(int8_t error) {
     case ERR_CLSD:       return "Connection closed";
     case ERR_ARG:        return "Illegal argument";
     case -55:            return "DNS failed";
+    case -60:            return "SSL handshake failed";
+    case -61:            return "SSL handshake timeout";
     default:             return "UNKNOWN";
   }
 }
@@ -1468,10 +1744,18 @@ const char *AsyncClient::stateToString() const {
  */
 
 AsyncServer::AsyncServer(ip_addr_t addr, uint16_t port)
-  : _port(port), _addr(addr), _noDelay(false), _pcb(nullptr), _connect_cb(nullptr), _connect_cb_arg(nullptr) {}
+  : _port(port), _addr(addr), _noDelay(false), _pcb(nullptr), _connect_cb(nullptr), _connect_cb_arg(nullptr)
+#if ASYNC_TCP_SSL_ENABLED
+    , _use_ssl(false), _cert(nullptr), _cert_len(0), _key(nullptr), _key_len(0), _ssl_file_cb(nullptr), _ssl_file_cb_arg(nullptr), _ssl_key_password(nullptr)
+#endif
+    {}
 
 #ifdef ARDUINO
-AsyncServer::AsyncServer(IPAddress addr, uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0) {
+AsyncServer::AsyncServer(IPAddress addr, uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0)
+#if ASYNC_TCP_SSL_ENABLED
+  , _use_ssl(false), _cert(0), _cert_len(0), _key(0), _key_len(0), _ssl_file_cb(0), _ssl_file_cb_arg(0), _ssl_key_password(0)
+#endif
+{
 #if ESP_IDF_VERSION_MAJOR < 5
 #if LWIP_IPV4 && LWIP_IPV6
   _addr.type = IPADDR_TYPE_V4;
@@ -1484,7 +1768,11 @@ AsyncServer::AsyncServer(IPAddress addr, uint16_t port) : _port(port), _noDelay(
 #endif
 }
 #if ESP_IDF_VERSION_MAJOR < 5 && __has_include(<IPv6Address.h>) && LWIP_IPV6
-AsyncServer::AsyncServer(IPv6Address addr, uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0) {
+AsyncServer::AsyncServer(IPv6Address addr, uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0)
+#if ASYNC_TCP_SSL_ENABLED
+  , _use_ssl(false), _cert(0), _cert_len(0), _key(0), _key_len(0), _ssl_file_cb(0), _ssl_file_cb_arg(0), _ssl_key_password(0)
+#endif
+{
 #if LWIP_IPV4 && LWIP_IPV6
   _addr.type = IPADDR_TYPE_V6;
 #endif
@@ -1494,7 +1782,11 @@ AsyncServer::AsyncServer(IPv6Address addr, uint16_t port) : _port(port), _noDela
 #endif
 #endif
 
-AsyncServer::AsyncServer(uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0) {
+AsyncServer::AsyncServer(uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0)
+#if ASYNC_TCP_SSL_ENABLED
+  , _use_ssl(false), _cert(0), _cert_len(0), _key(0), _key_len(0), _ssl_file_cb(0), _ssl_file_cb_arg(0), _ssl_key_password(0)
+#endif
+{
 #if LWIP_IPV4 && LWIP_IPV6
   _addr.type = IPADDR_TYPE_ANY;
   _addr.u_addr.ip4.addr = INADDR_ANY;
@@ -1611,6 +1903,33 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
 }
 
 int8_t AsyncServer::_accepted(AsyncClient *client) {
+#if ASYNC_TCP_SSL_ENABLED
+  if (_use_ssl && _cert && _key && client && client->pcb()) {
+    AsyncTCP_TLS_Context *ssl = new (std::nothrow) AsyncTCP_TLS_Context();
+    if (ssl) {
+      int ret = ssl->startSSLServer(client->pcb(), _cert, _cert_len, _key, _key_len, _ssl_key_password);
+      if (ret == 0) {
+        client->_ssl_ctx = ssl;
+        // Trigger handshake immediately
+        int hr = ssl->runSSLHandshake();
+        if (hr == 0) {
+          client->_ssl_handshake_done = true;
+          async_tcp_log_d("Server SSL handshake completed");
+        } else if (hr != MBEDTLS_ERR_SSL_WANT_READ && hr != MBEDTLS_ERR_SSL_WANT_WRITE) {
+          async_tcp_log_e("Server SSL handshake failed: %d", hr);
+          delete ssl;
+          client->_ssl_ctx = 0;
+        }
+        // If WANT_READ/WAIT_WRITE, handshake continues in _poll()
+      } else {
+        async_tcp_log_e("startSSLServer failed: %d", ret);
+        delete ssl;
+      }
+    } else {
+      async_tcp_log_e("Failed to allocate SSL context for server");
+    }
+  }
+#endif
   if (_connect_cb) {
     async_tcp_log_elapsed("onClient", _connect_cb(_connect_cb_arg, client));
   }
@@ -1624,6 +1943,59 @@ void AsyncServer::setNoDelay(bool nodelay) {
 bool AsyncServer::getNoDelay() const {
   return _noDelay;
 }
+
+#if ASYNC_TCP_SSL_ENABLED
+bool AsyncServer::beginSecure(const unsigned char *cert, size_t certLen,
+    const unsigned char *key, size_t keyLen) {
+  if (cert == NULL || key == NULL) {
+    async_tcp_log_e("SSL cert or key is NULL");
+    return false;
+  }
+  _cert = cert;
+  _cert_len = certLen;
+  _key = key;
+  _key_len = keyLen;
+  _use_ssl = true;
+  begin();
+  return _pcb != NULL;
+}
+
+bool AsyncServer::beginSecure(const char *certPEM, const char *keyPEM) {
+  return beginSecure(
+      (const unsigned char *)certPEM, certPEM ? strlen(certPEM) + 1 : 0,
+      (const unsigned char *)keyPEM, keyPEM ? strlen(keyPEM) + 1 : 0);
+}
+
+bool AsyncServer::beginSecure(const char *certPEM, const char *keyPEM, const char *password) {
+  _ssl_key_password = password;
+  return beginSecure(certPEM, keyPEM);
+}
+
+void AsyncServer::setDefaultCertificate(const unsigned char *cert, size_t certLen) {
+  _cert = cert;
+  _cert_len = certLen;
+}
+
+void AsyncServer::setDefaultKey(const unsigned char *key, size_t keyLen) {
+  _key = key;
+  _key_len = keyLen;
+}
+
+void AsyncServer::setDefaultCertificatePEM(const char *certPEM) {
+  _cert = (const unsigned char *)certPEM;
+  _cert_len = certPEM ? strlen(certPEM) + 1 : 0;
+}
+
+void AsyncServer::setDefaultKeyPEM(const char *keyPEM) {
+  _key = (const unsigned char *)keyPEM;
+  _key_len = keyPEM ? strlen(keyPEM) + 1 : 0;
+}
+
+void AsyncServer::onSslFileRequest(AcSSlFileHandler cb, void *arg) {
+  _ssl_file_cb = cb;
+  _ssl_file_cb_arg = arg;
+}
+#endif
 
 uint8_t AsyncServer::status() const {
   if (!_pcb) {

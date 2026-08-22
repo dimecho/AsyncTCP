@@ -7,6 +7,11 @@
 #include "AsyncTCPVersion.h"
 #define ASYNCTCP_FORK_ESP32Async
 
+// SSL support — default enabled, set to 0 before including this header to disable
+#ifndef ASYNC_TCP_SSL_ENABLED
+#define ASYNC_TCP_SSL_ENABLED 0
+#endif
+
 #ifdef ARDUINO
 #include "IPAddress.h"
 #if __has_include(<IPv6Address.h>)
@@ -17,6 +22,10 @@
 #include "lwip/ip6_addr.h"
 #include "lwip/ip_addr.h"
 #include <functional>
+
+#if ASYNC_TCP_SSL_ENABLED
+typedef std::function<int(void *arg, const char *filename, uint8_t **buf)> AcSSlFileHandler;
+#endif
 
 #ifndef LIBRETINY
 #include "sdkconfig.h"
@@ -62,6 +71,11 @@ class AsyncClient;
 
 #define ASYNC_WRITE_FLAG_COPY 0x01  // will allocate new buffer to hold the data while sending (else will hold reference to the data given)
 #define ASYNC_WRITE_FLAG_MORE 0x02  // will not send PSH flag, meaning that there should be more data to be sent before the application should react.
+
+#if ASYNC_TCP_SSL_ENABLED
+#define SSL_HANDSHAKE_TIMEOUT 10000
+class AsyncTCP_TLS_Context;
+#endif
 
 typedef std::function<void(void *, AsyncClient *)> AcConnectHandler;
 typedef std::function<void(void *, AsyncClient *, size_t len, uint32_t time)> AcAckHandler;
@@ -268,6 +282,26 @@ public:
     return _pcb;
   }
 
+#if ASYNC_TCP_SSL_ENABLED
+  // SSL support
+  bool beginSecure(const char *host, uint16_t port, const char *rootCA = NULL,
+      const char *clientCert = NULL, const char *clientKey = NULL);
+  bool beginSecure(const char *host, uint16_t port,
+      const unsigned char *rootCA, size_t rootCALen,
+      const unsigned char *clientCert = NULL, size_t clientCertLen = 0,
+      const unsigned char *clientKey = NULL, size_t clientKeyLen = 0);
+  bool ssl() const { return _ssl_ctx != 0; }
+  void setSSLReceiveTimeout(uint32_t timeout) { _ssl_timeout = timeout; }
+  uint32_t getSSLReceiveTimeout() const { return _ssl_timeout; }
+  AsyncTCP_TLS_Context *getSSLContext() { return _ssl_ctx; }
+  void feedSSLRxData(const unsigned char *data, size_t len);
+  size_t flushSSLTxData();
+  bool hasSSLRxData() const;
+  int sslRead(uint8_t *data, size_t len);
+  int sslWrite(const uint8_t *data, size_t len);
+  int runSSLHandshake();
+#endif
+
 protected:
   friend class AsyncTCP_detail;
   friend class AsyncServer;
@@ -308,6 +342,19 @@ protected:
   int8_t _fin(tcp_pcb *pcb, int8_t err);
   int8_t _lwip_fin(tcp_pcb *pcb, int8_t err);
   void _dns_found(ip_addr_t *ipaddr);
+#if ASYNC_TCP_SSL_ENABLED
+  AsyncTCP_TLS_Context *_ssl_ctx;
+  uint32_t _ssl_timeout;
+  bool _ssl_handshake_done;
+  // Stored for deferred handshake in _connected()
+  String _ssl_host;
+  const unsigned char *_ssl_ca_cert;
+  size_t _ssl_ca_cert_len;
+  const unsigned char *_ssl_client_cert;
+  size_t _ssl_client_cert_len;
+  const unsigned char *_ssl_client_key;
+  size_t _ssl_client_key_len;
+#endif
 };
 
 class AsyncServer {
@@ -328,6 +375,19 @@ public:
   bool getNoDelay() const;
   uint8_t status() const;
 
+#if ASYNC_TCP_SSL_ENABLED
+  // SSL server support
+  bool beginSecure(const unsigned char *cert, size_t certLen,
+      const unsigned char *key, size_t keyLen);
+  bool beginSecure(const char *certPEM, const char *keyPEM);
+  bool beginSecure(const char *certPEM, const char *keyPEM, const char *password);
+  void setDefaultCertificate(const unsigned char *cert, size_t certLen);
+  void setDefaultKey(const unsigned char *key, size_t keyLen);
+  void setDefaultCertificatePEM(const char *certPEM);
+  void setDefaultKeyPEM(const char *keyPEM);
+  void onSslFileRequest(AcSSlFileHandler cb, void *arg);
+#endif
+
 protected:
   friend class AsyncTCP_detail;
 
@@ -337,6 +397,17 @@ protected:
   tcp_pcb *_pcb;
   AcConnectHandler _connect_cb;
   void *_connect_cb_arg;
+
+#if ASYNC_TCP_SSL_ENABLED
+  bool _use_ssl;
+  const unsigned char *_cert;
+  size_t _cert_len;
+  const unsigned char *_key;
+  size_t _key_len;
+  AcSSlFileHandler _ssl_file_cb;
+  void *_ssl_file_cb_arg;
+  const char *_ssl_key_password;
+#endif
 
   int8_t _accept(tcp_pcb *newpcb, int8_t err);
   int8_t _accepted(AsyncClient *client);

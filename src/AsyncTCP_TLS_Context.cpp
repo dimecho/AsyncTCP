@@ -1,0 +1,574 @@
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// SSL/TLS support for AsyncTCP using mbedTLS over LwIP raw TCP (tcp_pcb)
+// Custom BIO callbacks replace BSD socket mbedtls_net_send/mbedtls_net_recv
+
+#include <Arduino.h>
+#include "AsyncTCPLogging.h"
+#include <mbedtls/sha256.h>
+#include <mbedtls/oid.h>
+#include <mbedtls/pem.h>
+
+extern "C" {
+#include "lwip/tcp.h"
+}
+
+#include "AsyncTCP_TLS_Context.h"
+
+#if ASYNC_TCP_SSL_ENABLED
+#if !defined(MBEDTLS_KEY_EXCHANGE__SOME__PSK_ENABLED) && !defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
+#  warning "Please configure IDF framework to include mbedTLS -> Enable pre-shared-key ciphersuites and activate at least one cipher"
+#else
+
+static const char *pers = "esp32-tls";
+
+// From mbedtls/net_sockets.h — not included since we use custom LwIP BIO
+#ifndef MBEDTLS_ERR_NET_SEND_FAILED
+#define MBEDTLS_ERR_NET_SEND_FAILED -0x004E
+#endif
+
+// DER cache — PEM parsed once, reused for all server connections
+static unsigned char *_cached_cert_der = NULL;
+static size_t _cached_cert_der_len = 0;
+static unsigned char *_cached_key_der = NULL;
+static size_t _cached_key_der_len = 0;
+
+static int _handle_error(int err) {
+    if (err == -30848) {
+        return err;
+    }
+#ifdef MBEDTLS_ERROR_C
+    char error_buf[100];
+    mbedtls_strerror(err, error_buf, 100);
+    async_tcp_log_e("(%d) %s", err, error_buf);
+#else
+    async_tcp_log_e("code %d", err);
+#endif
+    return err;
+}
+
+#define handle_error(e) _handle_error(e)
+
+/*
+ * Custom LwIP BIO callbacks for mbedTLS
+ * These bridge mbedTLS's I/O with LwIP raw TCP (tcp_pcb).
+ * The void* ctx points to the AsyncTCP_TLS_Context instance.
+ */
+
+static int _lwip_ssl_send(void *ctx, const unsigned char *buf, size_t len) {
+    AsyncTCP_TLS_Context *sslctx = (AsyncTCP_TLS_Context *)ctx;
+    if (!sslctx || !sslctx->pcb()) {
+        return MBEDTLS_ERR_NET_SEND_FAILED;
+    }
+    tcp_pcb *pcb = sslctx->pcb();
+
+    err_t err = tcp_write(pcb, buf, len, TCP_WRITE_FLAG_COPY);
+    if (err == ERR_OK) {
+        tcp_output(pcb);
+        return (int)len;
+    }
+    if (err == ERR_MEM) {
+        return MBEDTLS_ERR_SSL_WANT_WRITE;
+    }
+    return MBEDTLS_ERR_NET_SEND_FAILED;
+}
+
+static int _lwip_ssl_recv(void *ctx, unsigned char *buf, size_t len) {
+    AsyncTCP_TLS_Context *sslctx = (AsyncTCP_TLS_Context *)ctx;
+    if (!sslctx || !sslctx->hasRxData()) {
+        return MBEDTLS_ERR_SSL_WANT_READ;
+    }
+    return sslctx->read(buf, len);
+}
+
+/*
+ * AsyncTCP_TLS_Context implementation
+ */
+
+AsyncTCP_TLS_Context::AsyncTCP_TLS_Context(void) {
+    mbedtls_ssl_init(&ssl_ctx);
+    mbedtls_ssl_config_init(&ssl_conf);
+    mbedtls_ctr_drbg_init(&drbg_ctx);
+    mbedtls_entropy_init(&entropy_ctx);
+    _pcb = NULL;
+    _ssl_key_password = NULL;
+    _have_ca_cert = false;
+    _have_client_cert = false;
+    _have_client_key = false;
+    handshake_timeout = 120000;
+    handshake_start_time = 0;
+
+    _ssl_rx_buf = (unsigned char *)malloc(ASYNCTCP_TLS_RX_BUF_SIZE);
+    _ssl_rx_buf_len = 0;
+    _ssl_rx_pos = 0;
+    _ssl_rx_total = 0;
+
+    _ssl_tx_buf = (unsigned char *)malloc(ASYNCTCP_TLS_TX_BUF_SIZE);
+    _ssl_tx_buf_len = 0;
+    _ssl_tx_pos = 0;
+}
+
+AsyncTCP_TLS_Context::~AsyncTCP_TLS_Context() {
+    _deleteHandshakeCerts();
+
+    async_tcp_log_v("~AsyncTCP_TLS_Context");
+
+    mbedtls_ssl_free(&ssl_ctx);
+    mbedtls_ssl_config_free(&ssl_conf);
+    mbedtls_ctr_drbg_free(&drbg_ctx);
+    mbedtls_entropy_free(&entropy_ctx);
+
+    if (_ssl_rx_buf) {
+        free(_ssl_rx_buf);
+        _ssl_rx_buf = NULL;
+    }
+    if (_ssl_tx_buf) {
+        free(_ssl_tx_buf);
+        _ssl_tx_buf = NULL;
+    }
+}
+
+void AsyncTCP_TLS_Context::feedRxData(const unsigned char *data, size_t len) {
+    if (!_ssl_rx_buf || len == 0) return;
+    size_t space = ASYNCTCP_TLS_RX_BUF_SIZE - _ssl_rx_buf_len;
+    if (len > space) len = space;
+    memcpy(_ssl_rx_buf + _ssl_rx_buf_len, data, len);
+    _ssl_rx_buf_len += len;
+    _ssl_rx_total += len;
+}
+
+size_t AsyncTCP_TLS_Context::flushTxData(void) {
+    if (!_ssl_tx_buf || _ssl_tx_buf_len == 0 || !_pcb) return 0;
+    size_t sent = 0;
+    size_t remaining = _ssl_tx_buf_len - _ssl_tx_pos;
+    if (remaining > 0) {
+        err_t err = tcp_write(_pcb, _ssl_tx_buf + _ssl_tx_pos, remaining, TCP_WRITE_FLAG_COPY);
+        if (err == ERR_OK) {
+            tcp_output(_pcb);
+            sent = remaining;
+            _ssl_tx_buf_len = 0;
+            _ssl_tx_pos = 0;
+        } else if (err == ERR_MEM) {
+            // TCP buffer full, try to send what we can
+            size_t space = tcp_sndbuf(_pcb);
+            if (space > 0) {
+                err_t err2 = tcp_write(_pcb, _ssl_tx_buf + _ssl_tx_pos, space, TCP_WRITE_FLAG_COPY);
+                if (err2 == ERR_OK) {
+                    tcp_output(_pcb);
+                    sent = space;
+                    _ssl_tx_pos += space;
+                }
+            }
+        }
+    }
+    if (sent == 0 && _ssl_tx_buf_len > 0 && _ssl_tx_pos >= _ssl_tx_buf_len) {
+        _ssl_tx_buf_len = 0;
+        _ssl_tx_pos = 0;
+    }
+    return sent;
+}
+
+int AsyncTCP_TLS_Context::startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip) {
+    return _startSSLClient(pcb, host_or_ip,
+        NULL, 0,
+        NULL, 0,
+        NULL, 0,
+        NULL, NULL,
+        true);
+}
+
+int AsyncTCP_TLS_Context::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+        const char *pskIdent, const char *psKey) {
+    return _startSSLClient(pcb, host_or_ip,
+        NULL, 0,
+        NULL, 0,
+        NULL, 0,
+        pskIdent, psKey,
+        false);
+}
+
+int AsyncTCP_TLS_Context::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+        const char *rootCABuff,
+        const char *cli_cert,
+        const char *cli_key) {
+    return startSSLClient(pcb, host_or_ip,
+        (const unsigned char *)rootCABuff, (rootCABuff != NULL) ? strlen(rootCABuff) + 1 : 0,
+        (const unsigned char *)cli_cert, (cli_cert != NULL) ? strlen(cli_cert) + 1 : 0,
+        (const unsigned char *)cli_key, (cli_key != NULL) ? strlen(cli_key) + 1 : 0);
+}
+
+int AsyncTCP_TLS_Context::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+        const unsigned char *rootCABuff, const size_t rootCABuff_len,
+        const unsigned char *cli_cert, const size_t cli_cert_len,
+        const unsigned char *cli_key, const size_t cli_key_len) {
+    return _startSSLClient(pcb, host_or_ip,
+        rootCABuff, rootCABuff_len,
+        cli_cert, cli_cert_len,
+        cli_key, cli_key_len,
+        NULL, NULL,
+        false);
+}
+
+int AsyncTCP_TLS_Context::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+        const unsigned char *rootCABuff, const size_t rootCABuff_len,
+        const unsigned char *cli_cert, const size_t cli_cert_len,
+        const unsigned char *cli_key, const size_t cli_key_len,
+        const char *pskIdent, const char *psKey,
+        bool insecure) {
+    int ret;
+
+    if (rootCABuff == NULL && pskIdent == NULL && psKey == NULL && !insecure) {
+        return -1;
+    }
+
+    if (!pcb) {
+        return -1;
+    }
+
+    async_tcp_log_v("Seeding the random number generator");
+    mbedtls_entropy_init(&entropy_ctx);
+
+    ret = mbedtls_ctr_drbg_seed(&drbg_ctx, mbedtls_entropy_func,
+                                &entropy_ctx, (const unsigned char *)pers, strlen(pers));
+    if (ret < 0) {
+        return handle_error(ret);
+    }
+
+    async_tcp_log_v("Setting up the SSL/TLS structure...");
+
+    if ((ret = mbedtls_ssl_config_defaults(&ssl_conf,
+                                           MBEDTLS_SSL_IS_CLIENT,
+                                           MBEDTLS_SSL_TRANSPORT_STREAM,
+                                           MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+        return handle_error(ret);
+    }
+
+    if (insecure) {
+        mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+        async_tcp_log_i("WARNING: Skipping SSL Verification. INSECURE!");
+    } else if (rootCABuff != NULL) {
+        async_tcp_log_v("Loading CA cert");
+        mbedtls_x509_crt_init(&ca_cert);
+        mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+        ret = mbedtls_x509_crt_parse(&ca_cert, rootCABuff, rootCABuff_len);
+        _have_ca_cert = true;
+        mbedtls_ssl_conf_ca_chain(&ssl_conf, &ca_cert, NULL);
+        if (ret < 0) {
+            _deleteHandshakeCerts();
+            return handle_error(ret);
+        }
+    } else if (pskIdent != NULL && psKey != NULL) {
+        async_tcp_log_v("Setting up PSK");
+        if ((strlen(psKey) & 1) != 0 || strlen(psKey) > 2 * MBEDTLS_PSK_MAX_LEN) {
+            async_tcp_log_e("pre-shared key not valid hex or too long");
+            return -1;
+        }
+        unsigned char psk[MBEDTLS_PSK_MAX_LEN];
+        size_t psk_len = strlen(psKey) / 2;
+        for (size_t j = 0; j < strlen(psKey); j += 2) {
+            char c = psKey[j];
+            if (c >= '0' && c <= '9') c -= '0';
+            else if (c >= 'A' && c <= 'F') c -= 'A' - 10;
+            else if (c >= 'a' && c <= 'f') c -= 'a' - 10;
+            else return -1;
+            psk[j / 2] = c << 4;
+            c = psKey[j + 1];
+            if (c >= '0' && c <= '9') c -= '0';
+            else if (c >= 'A' && c <= 'F') c -= 'A' - 10;
+            else if (c >= 'a' && c <= 'f') c -= 'a' - 10;
+            else return -1;
+            psk[j / 2] |= c;
+        }
+        ret = mbedtls_ssl_conf_psk(&ssl_conf, psk, psk_len,
+                (const unsigned char *)pskIdent, strlen(pskIdent));
+        if (ret != 0) {
+            async_tcp_log_e("mbedtls_ssl_conf_psk returned %d", ret);
+            return handle_error(ret);
+        }
+    } else {
+        return -1;
+    }
+
+    if (!insecure && cli_cert != NULL && cli_key != NULL) {
+        mbedtls_x509_crt_init(&client_cert);
+        mbedtls_pk_init(&client_key);
+
+        async_tcp_log_v("Loading CRT cert");
+        ret = mbedtls_x509_crt_parse(&client_cert, cli_cert, cli_cert_len);
+        _have_client_cert = true;
+        if (ret < 0) {
+            _deleteHandshakeCerts();
+            return handle_error(ret);
+        }
+
+        async_tcp_log_v("Loading private key");
+        ret = mbedtls_pk_parse_key(&client_key, cli_key, cli_key_len, NULL, 0, mbedtls_ctr_drbg_random, &drbg_ctx);
+        _have_client_key = true;
+        if (ret != 0) {
+            _deleteHandshakeCerts();
+            return handle_error(ret);
+        }
+
+        mbedtls_ssl_conf_own_cert(&ssl_conf, &client_cert, &client_key);
+    }
+
+    async_tcp_log_v("Setting hostname for TLS session...");
+    if ((ret = mbedtls_ssl_set_hostname(&ssl_ctx, host_or_ip)) != 0) {
+        _deleteHandshakeCerts();
+        return handle_error(ret);
+    }
+
+    mbedtls_ssl_conf_rng(&ssl_conf, mbedtls_ctr_drbg_random, &drbg_ctx);
+
+    // Reduce buffer sizes to fit ESP32 heap
+    mbedtls_ssl_conf_max_frag_len(&ssl_conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096);
+
+    if ((ret = mbedtls_ssl_setup(&ssl_ctx, &ssl_conf)) != 0) {
+        _deleteHandshakeCerts();
+        return handle_error(ret);
+    }
+
+    _pcb = pcb;
+    // Set BIO: ctx is this context (used by both send and recv callbacks)
+    mbedtls_ssl_set_bio(&ssl_ctx, this, _lwip_ssl_send, _lwip_ssl_recv, NULL);
+    handshake_start_time = 0;
+
+    return 0;
+}
+
+int AsyncTCP_TLS_Context::startSSLServer(tcp_pcb *pcb,
+        const unsigned char *server_cert, size_t server_cert_len,
+        const unsigned char *server_key, size_t server_key_len,
+        const char *password) {
+    int ret;
+
+    if (server_cert == NULL || server_key == NULL || !pcb) {
+        return -1;
+    }
+
+    _ssl_key_password = password;
+
+    async_tcp_log_v("Seeding the random number generator (server)");
+    mbedtls_entropy_init(&entropy_ctx);
+
+    ret = mbedtls_ctr_drbg_seed(&drbg_ctx, mbedtls_entropy_func,
+                                &entropy_ctx, (const unsigned char *)pers, strlen(pers));
+    if (ret < 0) {
+        return handle_error(ret);
+    }
+
+    async_tcp_log_v("Setting up the SSL/TLS structure (server)...");
+
+    if ((ret = mbedtls_ssl_config_defaults(&ssl_conf,
+                                           MBEDTLS_SSL_IS_SERVER,
+                                           MBEDTLS_SSL_TRANSPORT_STREAM,
+                                           MBEDTLS_SSL_PRESET_DEFAULT)) != 0) {
+        return handle_error(ret);
+    }
+
+    // Force TLS 1.2 only
+    mbedtls_ssl_conf_min_tls_version(&ssl_conf, MBEDTLS_SSL_VERSION_TLS1_2);
+    mbedtls_ssl_conf_max_tls_version(&ssl_conf, MBEDTLS_SSL_VERSION_TLS1_2);
+
+    // Disable renegotiation
+    mbedtls_ssl_conf_renegotiation(&ssl_conf, MBEDTLS_SSL_RENEGOTIATION_DISABLED);
+
+    // Pin fast cipher suite — hardware-accelerated AES-GCM + SHA256 on ESP32
+    static const int server_ciphersuites[] = {
+        MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        0
+    };
+    mbedtls_ssl_conf_ciphersuites(&ssl_conf, server_ciphersuites);
+
+    // Self-signed cert — no client certificate verification
+    mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+
+    // Load server certificate — use DER cache if available
+    mbedtls_x509_crt_init(&client_cert);
+
+    if (_cached_cert_der != NULL) {
+        async_tcp_log_v("Using cached cert DER (%u bytes)", (unsigned)_cached_cert_der_len);
+        ret = mbedtls_x509_crt_parse(&client_cert, _cached_cert_der, _cached_cert_der_len);
+    } else {
+        async_tcp_log_v("Parsing cert PEM -> DER (first connection, will cache)");
+        mbedtls_pem_context pem;
+        mbedtls_pem_init(&pem);
+        size_t use_len = 0;
+        ret = mbedtls_pem_read_buffer(&pem,
+            "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----",
+            server_cert, NULL, 0, &use_len);
+        if (ret == 0) {
+            const unsigned char *der_buf = mbedtls_pem_get_buffer(&pem, &_cached_cert_der_len);
+            _cached_cert_der = (unsigned char *)malloc(_cached_cert_der_len);
+            if (_cached_cert_der) {
+                memcpy(_cached_cert_der, der_buf, _cached_cert_der_len);
+            }
+            ret = mbedtls_x509_crt_parse(&client_cert, der_buf, _cached_cert_der_len);
+        }
+        mbedtls_pem_free(&pem);
+    }
+    _have_client_cert = true;
+    if (ret < 0) {
+        _deleteHandshakeCerts();
+        return handle_error(ret);
+    }
+
+    // Load server private key — use DER cache if available
+    mbedtls_pk_init(&client_key);
+
+    if (_cached_key_der != NULL) {
+        async_tcp_log_v("Using cached key DER (%u bytes)", (unsigned)_cached_key_der_len);
+        const unsigned char *pwd = (const unsigned char *)_ssl_key_password;
+        size_t pwd_len = _ssl_key_password ? strlen(_ssl_key_password) : 0;
+        ret = mbedtls_pk_parse_key(&client_key, _cached_key_der, _cached_key_der_len,
+            pwd, pwd_len, mbedtls_ctr_drbg_random, &drbg_ctx);
+    } else {
+        async_tcp_log_v("Parsing key PEM -> DER (first connection, will cache)");
+        mbedtls_pem_context pem;
+        mbedtls_pem_init(&pem);
+        size_t use_len = 0;
+        const unsigned char *pwd = (const unsigned char *)_ssl_key_password;
+        size_t pwd_len = _ssl_key_password ? strlen(_ssl_key_password) : 0;
+
+        const char *key_header, *key_footer;
+        if (strncmp((const char *)server_key, "-----BEGIN ENCRYPTED PRIVATE KEY-----", 37) == 0) {
+            key_header = "-----BEGIN ENCRYPTED PRIVATE KEY-----";
+            key_footer = "-----END ENCRYPTED PRIVATE KEY-----";
+        } else if (strncmp((const char *)server_key, "-----BEGIN PRIVATE KEY-----", 27) == 0) {
+            key_header = "-----BEGIN PRIVATE KEY-----";
+            key_footer = "-----END PRIVATE KEY-----";
+        } else {
+            key_header = "-----BEGIN RSA PRIVATE KEY-----";
+            key_footer = "-----END RSA PRIVATE KEY-----";
+        }
+        ret = mbedtls_pem_read_buffer(&pem, key_header, key_footer,
+            server_key, pwd, pwd_len, &use_len);
+        if (ret == 0) {
+            const unsigned char *der_buf = mbedtls_pem_get_buffer(&pem, &_cached_key_der_len);
+            _cached_key_der = (unsigned char *)malloc(_cached_key_der_len);
+            if (_cached_key_der) {
+                memcpy(_cached_key_der, der_buf, _cached_key_der_len);
+            }
+            ret = mbedtls_pk_parse_key(&client_key, der_buf, _cached_key_der_len,
+                NULL, 0, mbedtls_ctr_drbg_random, &drbg_ctx);
+        }
+        mbedtls_pem_free(&pem);
+    }
+    _have_client_key = true;
+    if (ret != 0) {
+        _deleteHandshakeCerts();
+        return handle_error(ret);
+    }
+
+    mbedtls_ssl_conf_own_cert(&ssl_conf, &client_cert, &client_key);
+
+    mbedtls_ssl_conf_rng(&ssl_conf, mbedtls_ctr_drbg_random, &drbg_ctx);
+
+    mbedtls_ssl_conf_max_frag_len(&ssl_conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096);
+
+    if ((ret = mbedtls_ssl_setup(&ssl_ctx, &ssl_conf)) != 0) {
+        _deleteHandshakeCerts();
+        return handle_error(ret);
+    }
+
+    _pcb = pcb;
+    mbedtls_ssl_set_bio(&ssl_ctx, this, _lwip_ssl_send, _lwip_ssl_recv, NULL);
+    handshake_start_time = 0;
+
+    return 0;
+}
+
+int AsyncTCP_TLS_Context::runSSLHandshake(void) {
+    int ret, flags;
+
+    if (!_pcb) return -1;
+
+    if (handshake_start_time == 0) handshake_start_time = millis();
+    ret = mbedtls_ssl_handshake(&ssl_ctx);
+    if (ret != 0) {
+        if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
+            return handle_error(ret);
+        }
+        if ((millis() - handshake_start_time) > handshake_timeout)
+            return -1;
+        return ret;
+    }
+
+    // Handshake completed, validate remote side if required...
+    if (_have_client_cert && _have_client_key) {
+        async_tcp_log_d("Protocol is %s Ciphersuite is %s", mbedtls_ssl_get_version(&ssl_ctx), mbedtls_ssl_get_ciphersuite(&ssl_ctx));
+        if ((ret = mbedtls_ssl_get_record_expansion(&ssl_ctx)) >= 0) {
+            async_tcp_log_d("Record expansion is %d", ret);
+        } else {
+            async_tcp_log_w("Record expansion is unknown (compression)");
+        }
+    }
+
+    async_tcp_log_v("Verifying peer X.509 certificate...");
+
+    flags = mbedtls_ssl_get_verify_result(&ssl_ctx);
+    if (flags != 0) {
+        char buf[512];
+        memset(buf, 0, sizeof(buf));
+        mbedtls_x509_crt_verify_info(buf, sizeof(buf), "  ! ", flags);
+        if (strstr(buf, "skipped") != NULL) {
+            async_tcp_log_v("Certificate verification was skipped (expected for self-signed server): %s", buf);
+        } else {
+            async_tcp_log_e("Failed to verify peer certificate! verification info: %s", buf);
+            _deleteHandshakeCerts();
+            return handle_error(-1);
+        }
+    } else {
+        async_tcp_log_v("Certificate verified.");
+    }
+
+    _deleteHandshakeCerts();
+    async_tcp_log_v("Free internal heap after TLS %u", ESP.getFreeHeap());
+
+    return 0;
+}
+
+int AsyncTCP_TLS_Context::write(const uint8_t *data, size_t len) {
+    if (!_pcb) return -1;
+
+    int ret = mbedtls_ssl_write(&ssl_ctx, data, len);
+    if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE && ret < 0) {
+        return handle_error(ret);
+    }
+    return ret;
+}
+
+int AsyncTCP_TLS_Context::read(uint8_t *data, size_t len) {
+    if (!_ssl_rx_buf || _ssl_rx_pos >= _ssl_rx_buf_len) return 0;
+    size_t avail = _ssl_rx_buf_len - _ssl_rx_pos;
+    size_t copy = (avail < len) ? avail : len;
+    memcpy(data, _ssl_rx_buf + _ssl_rx_pos, copy);
+    _ssl_rx_pos += copy;
+    // Reset buffer when all consumed (TCP ack already done in _recv)
+    if (_ssl_rx_pos >= _ssl_rx_buf_len) {
+        _ssl_rx_buf_len = 0;
+        _ssl_rx_pos = 0;
+        _ssl_rx_total = 0;
+    }
+    return (int)copy;
+}
+
+void AsyncTCP_TLS_Context::_deleteHandshakeCerts(void) {
+    if (_have_ca_cert) {
+        async_tcp_log_v("Cleaning CA certificate.");
+        mbedtls_x509_crt_free(&ca_cert);
+        _have_ca_cert = false;
+    }
+    if (_have_client_cert) {
+        async_tcp_log_v("Cleaning client certificate.");
+        mbedtls_x509_crt_free(&client_cert);
+        _have_client_cert = false;
+    }
+    if (_have_client_key) {
+        async_tcp_log_v("Cleaning client certificate key.");
+        mbedtls_pk_free(&client_key);
+        _have_client_key = false;
+    }
+}
+
+#endif
+#endif // ASYNC_TCP_SSL_ENABLED
