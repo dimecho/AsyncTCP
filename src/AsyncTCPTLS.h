@@ -20,7 +20,7 @@ struct tcp_pcb;
 #define ASYNCTCP_TLS_RX_BUF_SIZE    4096
 #define ASYNCTCP_TLS_TX_BUF_SIZE    4096
 
-class AsyncTCP_TLS_Context
+class AsyncTCPTLS
 {
 private:
     mbedtls_ssl_context ssl_ctx;
@@ -40,8 +40,8 @@ private:
 
     tcp_pcb *_pcb;
 
-    // PEM password for encrypted private keys
-    const char *_ssl_key_password;
+    // PEM password for encrypted private keys (owned copy via strdup)
+    char *_ssl_key_password;
 
     // Per-connection encrypted data buffers for BIO callbacks
     unsigned char *_ssl_rx_buf;
@@ -53,6 +53,8 @@ private:
     size_t _ssl_tx_buf_len;
     size_t _ssl_tx_pos;
 
+    bool _output_pending;  // tcp_write queued, tcp_output deferred
+
     int _startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const unsigned char *rootCABuff, const size_t rootCABuff_len,
         const unsigned char *cli_cert, const size_t cli_cert_len,
@@ -61,10 +63,11 @@ private:
         bool insecure);
 
     void _deleteHandshakeCerts(void);
+    static void _clear_DER_cache(void);
 
 public:
-    AsyncTCP_TLS_Context(void);
-    virtual ~AsyncTCP_TLS_Context();
+    AsyncTCPTLS(void);
+    virtual ~AsyncTCPTLS();
 
     // Feed encrypted data from TCP into BIO buffer
     void feedRxData(const unsigned char *data, size_t len);
@@ -77,6 +80,7 @@ public:
 
     // Public accessor for PCB (needed by BIO callbacks)
     tcp_pcb *pcb() const { return _pcb; }
+    void setOutputPending(bool v) { _output_pending = v; }
 
     int startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip);
 
@@ -103,6 +107,12 @@ public:
     int write(const uint8_t *data, size_t len);
 
     int read(uint8_t *data, size_t len);
+
+    // Decrypt application data via mbedtls_ssl_read (BIO pulls encrypted bytes internally)
+    int sslRead(uint8_t *data, size_t len);
+
+    // Flush deferred tcp_output (called after mbedtls_ssl_handshake/write/read completes)
+    void flushOutput(void);
 };
 
 #endif // ASYNC_TCP_SSL_ENABLED

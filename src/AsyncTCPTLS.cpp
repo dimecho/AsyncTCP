@@ -12,7 +12,7 @@ extern "C" {
 #include "lwip/tcp.h"
 }
 
-#include "AsyncTCP_TLS_Context.h"
+#include "AsyncTCPTLS.h"
 
 #if ASYNC_TCP_SSL_ENABLED
 #if !defined(MBEDTLS_KEY_EXCHANGE__SOME__PSK_ENABLED) && !defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
@@ -26,11 +26,22 @@ static const char *pers = "esp32-tls";
 #define MBEDTLS_ERR_NET_SEND_FAILED -0x004E
 #endif
 
+#ifndef SSL_HANDSHAKE_TIMEOUT
+#define SSL_HANDSHAKE_TIMEOUT 10000
+#endif
+
 // DER cache — PEM parsed once, reused for all server connections
 static unsigned char *_cached_cert_der = NULL;
 static size_t _cached_cert_der_len = 0;
 static unsigned char *_cached_key_der = NULL;
 static size_t _cached_key_der_len = 0;
+
+void AsyncTCPTLS::_clear_DER_cache(void) {
+    if (_cached_cert_der) { free(_cached_cert_der); _cached_cert_der = NULL; }
+    _cached_cert_der_len = 0;
+    if (_cached_key_der) { free(_cached_key_der); _cached_key_der = NULL; }
+    _cached_key_der_len = 0;
+}
 
 static int _handle_error(int err) {
     if (err == -30848) {
@@ -48,22 +59,73 @@ static int _handle_error(int err) {
 
 #define handle_error(e) _handle_error(e)
 
+#include "lwip/priv/tcpip_priv.h"
+
+typedef struct {
+    struct tcpip_api_call_data call;
+    tcp_pcb *pcb;
+    const void *data;
+    size_t size;
+    uint8_t apiflags;
+    err_t err;
+} ssl_tcp_api_call_t;
+
+static err_t _tcp_ssl_write_api(struct tcpip_api_call_data *api_call_msg) {
+    ssl_tcp_api_call_t *msg = (ssl_tcp_api_call_t *)api_call_msg;
+    msg->err = tcp_write(msg->pcb, msg->data, msg->size, msg->apiflags);
+    return msg->err;
+}
+
+static err_t _tcp_ssl_output_api(struct tcpip_api_call_data *api_call_msg) {
+    ssl_tcp_api_call_t *msg = (ssl_tcp_api_call_t *)api_call_msg;
+    msg->err = tcp_output(msg->pcb);
+    return msg->err;
+}
+
+static err_t _tcp_ssl_write(tcp_pcb *pcb, const void *data, size_t size, uint8_t apiflags) {
+    if (!pcb) return ERR_CONN;
+    ssl_tcp_api_call_t msg;
+    msg.pcb = pcb;
+    msg.data = data;
+    msg.size = size;
+    msg.apiflags = apiflags;
+    msg.err = ERR_CONN;
+    if (tcpip_api_call(_tcp_ssl_write_api, (struct tcpip_api_call_data *)&msg) != ERR_OK) {
+        return ERR_CONN;
+    }
+    return msg.err;
+}
+
+static err_t _tcp_ssl_output(tcp_pcb *pcb) {
+    if (!pcb) return ERR_CONN;
+    ssl_tcp_api_call_t msg;
+    msg.pcb = pcb;
+    msg.data = NULL;
+    msg.size = 0;
+    msg.apiflags = 0;
+    msg.err = ERR_CONN;
+    if (tcpip_api_call(_tcp_ssl_output_api, (struct tcpip_api_call_data *)&msg) != ERR_OK) {
+        return ERR_CONN;
+    }
+    return msg.err;
+}
+
 /*
  * Custom LwIP BIO callbacks for mbedTLS
  * These bridge mbedTLS's I/O with LwIP raw TCP (tcp_pcb).
- * The void* ctx points to the AsyncTCP_TLS_Context instance.
+ * The void* ctx points to the AsyncTCPTLS instance.
  */
 
 static int _lwip_ssl_send(void *ctx, const unsigned char *buf, size_t len) {
-    AsyncTCP_TLS_Context *sslctx = (AsyncTCP_TLS_Context *)ctx;
+    AsyncTCPTLS *sslctx = (AsyncTCPTLS *)ctx;
     if (!sslctx || !sslctx->pcb()) {
         return MBEDTLS_ERR_NET_SEND_FAILED;
     }
     tcp_pcb *pcb = sslctx->pcb();
 
-    err_t err = tcp_write(pcb, buf, len, TCP_WRITE_FLAG_COPY);
+    err_t err = _tcp_ssl_write(pcb, buf, len, TCP_WRITE_FLAG_COPY);
     if (err == ERR_OK) {
-        tcp_output(pcb);
+        sslctx->setOutputPending(true);
         return (int)len;
     }
     if (err == ERR_MEM) {
@@ -73,7 +135,7 @@ static int _lwip_ssl_send(void *ctx, const unsigned char *buf, size_t len) {
 }
 
 static int _lwip_ssl_recv(void *ctx, unsigned char *buf, size_t len) {
-    AsyncTCP_TLS_Context *sslctx = (AsyncTCP_TLS_Context *)ctx;
+    AsyncTCPTLS *sslctx = (AsyncTCPTLS *)ctx;
     if (!sslctx || !sslctx->hasRxData()) {
         return MBEDTLS_ERR_SSL_WANT_READ;
     }
@@ -81,10 +143,10 @@ static int _lwip_ssl_recv(void *ctx, unsigned char *buf, size_t len) {
 }
 
 /*
- * AsyncTCP_TLS_Context implementation
+ * AsyncTCPTLS implementation
  */
 
-AsyncTCP_TLS_Context::AsyncTCP_TLS_Context(void) {
+AsyncTCPTLS::AsyncTCPTLS(void) {
     mbedtls_ssl_init(&ssl_ctx);
     mbedtls_ssl_config_init(&ssl_conf);
     mbedtls_ctr_drbg_init(&drbg_ctx);
@@ -105,17 +167,23 @@ AsyncTCP_TLS_Context::AsyncTCP_TLS_Context(void) {
     _ssl_tx_buf = (unsigned char *)malloc(ASYNCTCP_TLS_TX_BUF_SIZE);
     _ssl_tx_buf_len = 0;
     _ssl_tx_pos = 0;
+    _output_pending = false;
 }
 
-AsyncTCP_TLS_Context::~AsyncTCP_TLS_Context() {
+AsyncTCPTLS::~AsyncTCPTLS() {
     _deleteHandshakeCerts();
 
-    async_tcp_log_v("~AsyncTCP_TLS_Context");
+    async_tcp_log_v("~AsyncTCPTLS");
 
     mbedtls_ssl_free(&ssl_ctx);
     mbedtls_ssl_config_free(&ssl_conf);
     mbedtls_ctr_drbg_free(&drbg_ctx);
     mbedtls_entropy_free(&entropy_ctx);
+
+    if (_ssl_key_password) {
+        free(_ssl_key_password);
+        _ssl_key_password = NULL;
+    }
 
     if (_ssl_rx_buf) {
         free(_ssl_rx_buf);
@@ -127,7 +195,7 @@ AsyncTCP_TLS_Context::~AsyncTCP_TLS_Context() {
     }
 }
 
-void AsyncTCP_TLS_Context::feedRxData(const unsigned char *data, size_t len) {
+void AsyncTCPTLS::feedRxData(const unsigned char *data, size_t len) {
     if (!_ssl_rx_buf || len == 0) return;
     size_t space = ASYNCTCP_TLS_RX_BUF_SIZE - _ssl_rx_buf_len;
     if (len > space) len = space;
@@ -136,14 +204,14 @@ void AsyncTCP_TLS_Context::feedRxData(const unsigned char *data, size_t len) {
     _ssl_rx_total += len;
 }
 
-size_t AsyncTCP_TLS_Context::flushTxData(void) {
+size_t AsyncTCPTLS::flushTxData(void) {
     if (!_ssl_tx_buf || _ssl_tx_buf_len == 0 || !_pcb) return 0;
     size_t sent = 0;
     size_t remaining = _ssl_tx_buf_len - _ssl_tx_pos;
     if (remaining > 0) {
-        err_t err = tcp_write(_pcb, _ssl_tx_buf + _ssl_tx_pos, remaining, TCP_WRITE_FLAG_COPY);
+        err_t err = _tcp_ssl_write(_pcb, _ssl_tx_buf + _ssl_tx_pos, remaining, TCP_WRITE_FLAG_COPY);
         if (err == ERR_OK) {
-            tcp_output(_pcb);
+            _tcp_ssl_output(_pcb);
             sent = remaining;
             _ssl_tx_buf_len = 0;
             _ssl_tx_pos = 0;
@@ -151,9 +219,9 @@ size_t AsyncTCP_TLS_Context::flushTxData(void) {
             // TCP buffer full, try to send what we can
             size_t space = tcp_sndbuf(_pcb);
             if (space > 0) {
-                err_t err2 = tcp_write(_pcb, _ssl_tx_buf + _ssl_tx_pos, space, TCP_WRITE_FLAG_COPY);
+                err_t err2 = _tcp_ssl_write(_pcb, _ssl_tx_buf + _ssl_tx_pos, space, TCP_WRITE_FLAG_COPY);
                 if (err2 == ERR_OK) {
-                    tcp_output(_pcb);
+                    _tcp_ssl_output(_pcb);
                     sent = space;
                     _ssl_tx_pos += space;
                 }
@@ -167,7 +235,7 @@ size_t AsyncTCP_TLS_Context::flushTxData(void) {
     return sent;
 }
 
-int AsyncTCP_TLS_Context::startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip) {
+int AsyncTCPTLS::startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip) {
     return _startSSLClient(pcb, host_or_ip,
         NULL, 0,
         NULL, 0,
@@ -176,7 +244,7 @@ int AsyncTCP_TLS_Context::startSSLClientInsecure(tcp_pcb *pcb, const char *host_
         true);
 }
 
-int AsyncTCP_TLS_Context::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const char *pskIdent, const char *psKey) {
     return _startSSLClient(pcb, host_or_ip,
         NULL, 0,
@@ -186,7 +254,7 @@ int AsyncTCP_TLS_Context::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         false);
 }
 
-int AsyncTCP_TLS_Context::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const char *rootCABuff,
         const char *cli_cert,
         const char *cli_key) {
@@ -196,7 +264,7 @@ int AsyncTCP_TLS_Context::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         (const unsigned char *)cli_key, (cli_key != NULL) ? strlen(cli_key) + 1 : 0);
 }
 
-int AsyncTCP_TLS_Context::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const unsigned char *rootCABuff, const size_t rootCABuff_len,
         const unsigned char *cli_cert, const size_t cli_cert_len,
         const unsigned char *cli_key, const size_t cli_key_len) {
@@ -208,7 +276,7 @@ int AsyncTCP_TLS_Context::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         false);
 }
 
-int AsyncTCP_TLS_Context::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const unsigned char *rootCABuff, const size_t rootCABuff_len,
         const unsigned char *cli_cert, const size_t cli_cert_len,
         const unsigned char *cli_key, const size_t cli_key_len,
@@ -225,7 +293,6 @@ int AsyncTCP_TLS_Context::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
     }
 
     async_tcp_log_v("Seeding the random number generator");
-    mbedtls_entropy_init(&entropy_ctx);
 
     ret = mbedtls_ctr_drbg_seed(&drbg_ctx, mbedtls_entropy_func,
                                 &entropy_ctx, (const unsigned char *)pers, strlen(pers));
@@ -280,6 +347,7 @@ int AsyncTCP_TLS_Context::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         }
         ret = mbedtls_ssl_conf_psk(&ssl_conf, psk, psk_len,
                 (const unsigned char *)pskIdent, strlen(pskIdent));
+        mbedtls_platform_zeroize(psk, sizeof(psk));
         if (ret != 0) {
             async_tcp_log_e("mbedtls_ssl_conf_psk returned %d", ret);
             return handle_error(ret);
@@ -312,6 +380,11 @@ int AsyncTCP_TLS_Context::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
     }
 
     async_tcp_log_v("Setting hostname for TLS session...");
+    if (!host_or_ip || strlen(host_or_ip) > 253) {
+        _deleteHandshakeCerts();
+        async_tcp_log_e("Invalid hostname (too long or NULL)");
+        return -1;
+    }
     if ((ret = mbedtls_ssl_set_hostname(&ssl_ctx, host_or_ip)) != 0) {
         _deleteHandshakeCerts();
         return handle_error(ret);
@@ -335,7 +408,7 @@ int AsyncTCP_TLS_Context::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
     return 0;
 }
 
-int AsyncTCP_TLS_Context::startSSLServer(tcp_pcb *pcb,
+int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
         const unsigned char *server_cert, size_t server_cert_len,
         const unsigned char *server_key, size_t server_key_len,
         const char *password) {
@@ -345,10 +418,10 @@ int AsyncTCP_TLS_Context::startSSLServer(tcp_pcb *pcb,
         return -1;
     }
 
-    _ssl_key_password = password;
+    if (_ssl_key_password) { free(_ssl_key_password); _ssl_key_password = NULL; }
+    _ssl_key_password = password ? strdup(password) : NULL;
 
     async_tcp_log_v("Seeding the random number generator (server)");
-    mbedtls_entropy_init(&entropy_ctx);
 
     ret = mbedtls_ctr_drbg_seed(&drbg_ctx, mbedtls_entropy_func,
                                 &entropy_ctx, (const unsigned char *)pers, strlen(pers));
@@ -473,17 +546,19 @@ int AsyncTCP_TLS_Context::startSSLServer(tcp_pcb *pcb,
     _pcb = pcb;
     mbedtls_ssl_set_bio(&ssl_ctx, this, _lwip_ssl_send, _lwip_ssl_recv, NULL);
     handshake_start_time = 0;
+    handshake_timeout = SSL_HANDSHAKE_TIMEOUT;
 
     return 0;
 }
 
-int AsyncTCP_TLS_Context::runSSLHandshake(void) {
+int AsyncTCPTLS::runSSLHandshake(void) {
     int ret, flags;
 
     if (!_pcb) return -1;
 
     if (handshake_start_time == 0) handshake_start_time = millis();
     ret = mbedtls_ssl_handshake(&ssl_ctx);
+    flushOutput();
     if (ret != 0) {
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
             return handle_error(ret);
@@ -527,17 +602,18 @@ int AsyncTCP_TLS_Context::runSSLHandshake(void) {
     return 0;
 }
 
-int AsyncTCP_TLS_Context::write(const uint8_t *data, size_t len) {
+int AsyncTCPTLS::write(const uint8_t *data, size_t len) {
     if (!_pcb) return -1;
 
     int ret = mbedtls_ssl_write(&ssl_ctx, data, len);
+    flushOutput();
     if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE && ret < 0) {
         return handle_error(ret);
     }
     return ret;
 }
 
-int AsyncTCP_TLS_Context::read(uint8_t *data, size_t len) {
+int AsyncTCPTLS::read(uint8_t *data, size_t len) {
     if (!_ssl_rx_buf || _ssl_rx_pos >= _ssl_rx_buf_len) return 0;
     size_t avail = _ssl_rx_buf_len - _ssl_rx_pos;
     size_t copy = (avail < len) ? avail : len;
@@ -552,7 +628,35 @@ int AsyncTCP_TLS_Context::read(uint8_t *data, size_t len) {
     return (int)copy;
 }
 
-void AsyncTCP_TLS_Context::_deleteHandshakeCerts(void) {
+int AsyncTCPTLS::sslRead(uint8_t *data, size_t len) {
+    if (!_pcb) return -1;
+    int ret = mbedtls_ssl_read(&ssl_ctx, data, len);
+    flushOutput();
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
+        return 0;
+    }
+    if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+        async_tcp_log_i("SSL peer close notify");
+        return 0;
+    }
+    if (ret == MBEDTLS_ERR_SSL_CONN_EOF) {
+        return 0;
+    }
+    if (ret < 0) {
+        async_tcp_log_e("mbedtls_ssl_read failed: -0x%04x", -ret);
+        return -1;
+    }
+    return ret;
+}
+
+void AsyncTCPTLS::flushOutput(void) {
+    if (_output_pending && _pcb) {
+        _tcp_ssl_output(_pcb);
+        _output_pending = false;
+    }
+}
+
+void AsyncTCPTLS::_deleteHandshakeCerts(void) {
     if (_have_ca_cert) {
         async_tcp_log_v("Cleaning CA certificate.");
         mbedtls_x509_crt_free(&ca_cert);

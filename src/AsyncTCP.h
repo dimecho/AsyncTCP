@@ -74,7 +74,7 @@ class AsyncClient;
 
 #if ASYNC_TCP_SSL_ENABLED
 #define SSL_HANDSHAKE_TIMEOUT 10000
-class AsyncTCP_TLS_Context;
+class AsyncTCPTLS;
 #endif
 
 typedef std::function<void(void *, AsyncClient *)> AcConnectHandler;
@@ -293,7 +293,7 @@ public:
   bool ssl() const { return _ssl_ctx != 0; }
   void setSSLReceiveTimeout(uint32_t timeout) { _ssl_timeout = timeout; }
   uint32_t getSSLReceiveTimeout() const { return _ssl_timeout; }
-  AsyncTCP_TLS_Context *getSSLContext() { return _ssl_ctx; }
+  AsyncTCPTLS *getSSLContext() { return _ssl_ctx; }
   void feedSSLRxData(const unsigned char *data, size_t len);
   size_t flushSSLTxData();
   bool hasSSLRxData() const;
@@ -343,7 +343,7 @@ protected:
   int8_t _lwip_fin(tcp_pcb *pcb, int8_t err);
   void _dns_found(ip_addr_t *ipaddr);
 #if ASYNC_TCP_SSL_ENABLED
-  AsyncTCP_TLS_Context *_ssl_ctx;
+  AsyncTCPTLS *_ssl_ctx;
   uint32_t _ssl_timeout;
   bool _ssl_handshake_done;
   // Stored for deferred handshake in _connected()

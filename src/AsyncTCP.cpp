@@ -6,7 +6,7 @@
 #include "AsyncTCPSimpleIntrusiveList.h"
 
 #if ASYNC_TCP_SSL_ENABLED
-#include "AsyncTCP_TLS_Context.h"
+#include "AsyncTCPTLS.h"
 #endif
 
 /**
@@ -1008,7 +1008,7 @@ bool AsyncClient::hasSSLRxData() const {
 
 int AsyncClient::sslRead(uint8_t *data, size_t len) {
   if (_ssl_ctx) {
-    return _ssl_ctx->read(data, len);
+    return _ssl_ctx->sslRead(data, len);
   }
   return -1;
 }
@@ -1147,7 +1147,7 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
 #if ASYNC_TCP_SSL_ENABLED
   if (_ssl_host.length() > 0 && !_ssl_ctx) {
     // Create SSL context and start handshake
-    _ssl_ctx = new (std::nothrow) AsyncTCP_TLS_Context();
+    _ssl_ctx = new (std::nothrow) AsyncTCPTLS();
     if (!_ssl_ctx) {
       async_tcp_log_e("failed to allocate SSL context");
       if (_error_cb) {
@@ -1299,9 +1299,9 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
     }
     // Decrypt all available plaintext
     _ack_pcb = true;
-    uint8_t buf[256];
+    uint8_t buf[1024];
     int n;
-    while ((n = _ssl_ctx->read(buf, sizeof(buf))) > 0) {
+    while ((n = _ssl_ctx->sslRead(buf, sizeof(buf))) > 0) {
       if (_recv_cb) {
         async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, buf, n));
       }
@@ -1309,6 +1309,7 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
         _rx_ack_len += n;
       }
     }
+    _ssl_ctx->flushOutput();
     return ERR_OK;
   }
 #endif
@@ -1905,22 +1906,12 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
 int8_t AsyncServer::_accepted(AsyncClient *client) {
 #if ASYNC_TCP_SSL_ENABLED
   if (_use_ssl && _cert && _key && client && client->pcb()) {
-    AsyncTCP_TLS_Context *ssl = new (std::nothrow) AsyncTCP_TLS_Context();
+    AsyncTCPTLS *ssl = new (std::nothrow) AsyncTCPTLS();
     if (ssl) {
       int ret = ssl->startSSLServer(client->pcb(), _cert, _cert_len, _key, _key_len, _ssl_key_password);
       if (ret == 0) {
         client->_ssl_ctx = ssl;
-        // Trigger handshake immediately
-        int hr = ssl->runSSLHandshake();
-        if (hr == 0) {
-          client->_ssl_handshake_done = true;
-          async_tcp_log_d("Server SSL handshake completed");
-        } else if (hr != MBEDTLS_ERR_SSL_WANT_READ && hr != MBEDTLS_ERR_SSL_WANT_WRITE) {
-          async_tcp_log_e("Server SSL handshake failed: %d", hr);
-          delete ssl;
-          client->_ssl_ctx = 0;
-        }
-        // If WANT_READ/WAIT_WRITE, handshake continues in _poll()
+        async_tcp_log_d("Server SSL context ready, handshake will start on first poll");
       } else {
         async_tcp_log_e("startSSLServer failed: %d", ret);
         delete ssl;
