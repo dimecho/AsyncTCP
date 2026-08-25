@@ -811,7 +811,7 @@ AsyncClient::~AsyncClient() {
     delete _ssl_ctx;
     _ssl_ctx = 0;
   }
-  if (_ssl_key_password) { free(_ssl_key_password); _ssl_key_password = NULL; }
+  if (_ssl_key_password) { ::free((void*)_ssl_key_password); _ssl_key_password = NULL; }
 #endif
   if (_pcb) {
     _close();
@@ -975,7 +975,7 @@ void AsyncClient::_clearSSLParams(void) {
   _ssl_client_cert_len = 0;
   _ssl_client_key = NULL;
   _ssl_client_key_len = 0;
-  if (_ssl_key_password) { free(_ssl_key_password); _ssl_key_password = NULL; }
+  if (_ssl_key_password) { ::free((void*)_ssl_key_password); _ssl_key_password = NULL; }
 }
 
 bool AsyncClient::beginSecure(const char *host, uint16_t port, const char *rootCA,
@@ -1004,7 +1004,7 @@ bool AsyncClient::beginSecure(const char *host, uint16_t port,
   _ssl_client_cert_len = clientCertLen;
   _ssl_client_key = clientKey;
   _ssl_client_key_len = clientKeyLen;
-  if (_ssl_key_password) { free(_ssl_key_password); _ssl_key_password = NULL; }
+  if (_ssl_key_password) { ::free((void*)_ssl_key_password); _ssl_key_password = NULL; }
   _ssl_key_password = keyPassword ? strdup(keyPassword) : NULL;
   return connect(host, port);
 }

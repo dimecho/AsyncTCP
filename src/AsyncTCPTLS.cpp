@@ -158,7 +158,7 @@ AsyncTCPTLS::~AsyncTCPTLS() {
     mbedtls_ssl_config_free(&ssl_conf);
 
     if (_ssl_key_password) {
-        free(_ssl_key_password);
+        free((void*)_ssl_key_password);
         _ssl_key_password = NULL;
     }
 
@@ -267,7 +267,7 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
     if (rootCABuff == NULL) {
         mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
         async_tcp_log_i("WARNING: Skipping SSL Verification. INSECURE!");
-    } else {
+    } else if (rootCABuff != NULL) {
         async_tcp_log_v("Loading CA cert");
         mbedtls_x509_crt_init(&ca_cert);
         mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
@@ -316,7 +316,7 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         return -1;
     }
 
-    if (!insecure && cli_cert != NULL && cli_key != NULL) {
+    if (rootCABuff != NULL && cli_cert != NULL && cli_key != NULL) {
         mbedtls_x509_crt_init(&client_cert);
         mbedtls_pk_init(&client_key);
 
@@ -329,7 +329,7 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         }
 
         async_tcp_log_v("Loading private key");
-        if (_ssl_key_password) { free(_ssl_key_password); _ssl_key_password = NULL; }
+        if (_ssl_key_password) { free((void*)_ssl_key_password); _ssl_key_password = NULL; }
         _ssl_key_password = keyPassword ? strdup(keyPassword) : NULL;
         const unsigned char *pwd = (const unsigned char *)_ssl_key_password;
         size_t pwd_len = _ssl_key_password ? strlen(_ssl_key_password) : 0;
@@ -384,7 +384,7 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
         return -1;
     }
 
-    if (_ssl_key_password) { free(_ssl_key_password); _ssl_key_password = NULL; }
+    if (_ssl_key_password) { free((void*)_ssl_key_password); _ssl_key_password = NULL; }
     _ssl_key_password = password ? strdup(password) : NULL;
 
     async_tcp_log_v("Seeding the random number generator (server)");
