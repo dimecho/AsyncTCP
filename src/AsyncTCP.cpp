@@ -1312,15 +1312,11 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
       pbuf_free(b);
     }
     // Decrypt all available plaintext
-    _ack_pcb = true;
     uint8_t buf[1024];
     int n;
     while ((n = _ssl_ctx->sslRead(buf, sizeof(buf))) > 0) {
       if (_recv_cb) {
         async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, buf, n));
-      }
-      if (!_ack_pcb) {
-        _rx_ack_len += n;
       }
     }
     _ssl_ctx->flushOutput();
