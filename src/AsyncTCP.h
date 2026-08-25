@@ -24,7 +24,7 @@
 #include <functional>
 
 #if ASYNC_TCP_SSL_ENABLED
-typedef std::function<int(void *arg, const char *filename, uint8_t **buf)> AcSSlFileHandler;
+typedef std::function<int(void *arg, uint8_t **cert, uint8_t **key)> AcSSlFileHandler;
 #endif
 
 #ifndef LIBRETINY

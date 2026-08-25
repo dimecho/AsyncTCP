@@ -1867,6 +1867,9 @@ void AsyncServer::end() {
     }
     _pcb = NULL;
   }
+#if ASYNC_TCP_SSL_ENABLED
+  AsyncTCPTLS::_clear_DER_cache();
+#endif
 }
 
 // runs on LwIP thread
@@ -1915,22 +1918,50 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
 
 int8_t AsyncServer::_accepted(AsyncClient *client) {
 #if ASYNC_TCP_SSL_ENABLED
-  if (_use_ssl && _cert && _key && client && client->pcb()) {
-    AsyncTCPTLS *ssl = new (std::nothrow) AsyncTCPTLS();
-    if (ssl) {
-      int ret = ssl->startSSLServer(client->pcb(), _cert, _cert_len, _key, _key_len, _ssl_key_password);
-      if (ret == 0) {
-        client->_ssl_ctx = ssl;
-        async_tcp_log_d("Server SSL context ready, handshake will start on first poll");
+  if (_use_ssl && client && client->pcb()) {
+    const unsigned char *cert = _cert;
+    size_t cert_len = _cert_len;
+    const unsigned char *key = _key;
+    size_t key_len = _key_len;
+    uint8_t *cb_cert = NULL;
+    uint8_t *cb_key = NULL;
+
+    // If cert/key not pre-loaded, try the file handler callback
+    if (!cert && !key && _ssl_file_cb) {
+      int r = _ssl_file_cb(_ssl_file_cb_arg, &cb_cert, &cb_key);
+      if (r == 0) {
+        if (cb_cert) { cert = cb_cert; cert_len = strlen((const char *)cb_cert) + 1; }
+        if (cb_key) { key = cb_key; key_len = strlen((const char *)cb_key) + 1; }
+      }
+    }
+
+    if (cert && key) {
+      AsyncTCPTLS *ssl = new (std::nothrow) AsyncTCPTLS();
+      if (ssl) {
+        int ret = ssl->startSSLServer(client->pcb(), cert, cert_len, key, key_len, _ssl_key_password);
+        if (ret == 0) {
+          client->_ssl_ctx = ssl;
+          async_tcp_log_d("Server SSL context ready, handshake will start on first poll");
+        } else {
+          async_tcp_log_e("startSSLServer failed: %d", ret);
+          delete ssl;
+          client->abort();
+          if (cb_cert) free(cb_cert);
+          if (cb_key) free(cb_key);
+          return ERR_ABRT;
+        }
       } else {
-        async_tcp_log_e("startSSLServer failed: %d", ret);
-        delete ssl;
+        async_tcp_log_e("Failed to allocate SSL context for server");
         client->abort();
+        if (cb_cert) free(cb_cert);
+        if (cb_key) free(cb_key);
         return ERR_ABRT;
       }
     } else {
-      async_tcp_log_e("Failed to allocate SSL context for server");
+      async_tcp_log_e("SSL enabled but no certificate available");
       client->abort();
+      if (cb_cert) free(cb_cert);
+      if (cb_key) free(cb_key);
       return ERR_ABRT;
     }
   }

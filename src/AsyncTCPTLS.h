@@ -63,11 +63,12 @@ private:
         bool insecure);
 
     void _deleteHandshakeCerts(void);
-    static void _clear_DER_cache(void);
 
 public:
     AsyncTCPTLS(void);
     virtual ~AsyncTCPTLS();
+
+    static void _clear_DER_cache(void);
 
     // Feed encrypted data from TCP into BIO buffer
     void feedRxData(const unsigned char *data, size_t len);
