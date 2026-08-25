@@ -1,13 +1,13 @@
 /*
- * AsyncTCPSSL - AsyncWebServerSSL example
+ * AsyncTCP - WebServerSSL example
  *
- * ESP32 HTTPS server using ESPAsyncWebServer + AsyncTCPSSL.
+ * ESP32 HTTPS server using AsyncTCP + AsyncTCPTLS directly.
  * Serves a simple page and a JSON API over TLS 1.2 on port 443.
  * Includes a ready-to-use self-signed cert (key password: test123).
  *
- * Regenerate your own:
- *   openssl req -x509 -newkey rsa:2048 -passout pass:test123 \
- *     -keyout server.key -out server.pem -days 3650 \
+ * Regenerate your own (RSA-2048):
+ *   openssl req -x509 -newkey rsa:2048 \
+ *     -passout pass:test123 -keyout server.key -out server.pem -days 3650 \
  *     -subj "/CN=esp32.local" \
  *     -addext "subjectAltName=DNS:esp32.local,IP:192.168.4.1"
  *
@@ -20,14 +20,13 @@
 
 #include <WiFi.h>
 #include <AsyncTCP.h>
-#include <ESPAsyncWebServer.h>
 
 const char *SSID     = "YOUR_SSID";
 const char *PASSWORD = "YOUR_PASSWORD";
 
-// Self-signed cert for esp32.local — key password: test123
-// Regenerate: openssl req -x509 -newkey rsa:2048 -passout pass:test123 \
-//   -keyout server.key -out server.pem -days 3650 \
+// Self-signed RSA-2048 cert for esp32.local — key password: test123
+// Regenerate: openssl req -x509 -newkey rsa:2048 \
+//   -passout pass:test123 -keyout server.key -out server.pem -days 3650 \
 //   -subj "/CN=esp32.local" -addext "subjectAltName=DNS:esp32.local,IP:192.168.4.1"
 static const char SERVER_CERT[] PROGMEM = R"EOF(
 -----BEGIN CERTIFICATE-----
@@ -84,15 +83,29 @@ CcL72QSXG4Pjb0QUXb8tnDfnrTPcffQbKgTrqvjFpPKDlATFaUeVz+8=
 -----END ENCRYPTED PRIVATE KEY-----
 )EOF";
 
-AsyncWebServer server(443);
-AsyncWebServer httpserver(80);
+AsyncServer *sslServer = NULL;
 
-const char index_html[] PROGMEM = R"rawliteral(
+static void sendResponse(AsyncClient *client, int code, const char *contentType,
+                         const char *body, size_t bodyLen) {
+  char header[128];
+  int headerLen = snprintf(header, sizeof(header),
+    "HTTP/1.1 %s\r\n"
+    "Content-Type: %s\r\n"
+    "Content-Length: %u\r\n"
+    "Connection: close\r\n"
+    "\r\n",
+    code == 200 ? "200 OK" : "301 Moved",
+    contentType, (unsigned)bodyLen);
+  client->write(header, headerLen);
+  client->write(body, bodyLen);
+}
+
+static const char INDEX_PAGE[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>AsyncWebServerSSL</title>
+  <title>WebServerSSL</title>
   <style>
     body { font-family: sans-serif; text-align: center; padding: 2em; }
     h1 { color: #2c3e50; }
@@ -100,12 +113,40 @@ const char index_html[] PROGMEM = R"rawliteral(
   </style>
 </head>
 <body>
-  <h1>AsyncWebServerSSL</h1>
+  <h1>WebServerSSL</h1>
   <p>HTTPS is working!</p>
   <p><a href="/api">/api</a> - JSON endpoint</p>
 </body>
 </html>
 )rawliteral";
+
+void onClient(void *arg, AsyncClient *client) {
+  if (!client) return;
+
+  client->onData([](void *arg, AsyncClient *client, void *data, size_t len) {
+    String request((const char *)data, len);
+
+    if (request.startsWith("GET /api")) {
+      char json[128];
+      int jsonLen = snprintf(json, sizeof(json),
+        "{\"status\":\"ok\",\"heap\":%u,\"uptime\":%lu}",
+        ESP.getFreeHeap(), millis() / 1000);
+      sendResponse(client, 200, "application/json", json, jsonLen);
+    } else {
+      sendResponse(client, 200, "text/html", INDEX_PAGE, sizeof(INDEX_PAGE) - 1);
+    }
+    client->close();
+  });
+
+  client->onError([](void *arg, AsyncClient *client, int8_t error) {
+    Serial.printf("Connection error: %d\n", error);
+    delete client;
+  });
+
+  client->onDisconnect([](void *arg, AsyncClient *client) {
+    delete client;
+  });
+}
 
 void setup() {
   Serial.begin(115200);
@@ -119,34 +160,13 @@ void setup() {
   }
   Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
 
-  // Serve a simple HTML page
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-    request->send(200, "text/html", index_html);
-  });
+  sslServer = new AsyncServer(443);
+  sslServer->onClient(onClient, NULL);
+  sslServer->beginSecure(SERVER_CERT, SERVER_KEY, "test123");
 
-  // JSON API endpoint
-  server.on("/api", HTTP_GET, [](AsyncWebServerRequest *request) {
-    AsyncJsonResponse *response = new AsyncJsonResponse();
-    JsonObject root = response->getRoot();
-    root["status"] = "ok";
-    root["heap"] = ESP.getFreeHeap();
-    root["uptime"] = millis() / 1000;
-    response->setLength();
-    request->send(response);
-  });
-
-  // Start HTTPS server
-  server.beginSecure(SERVER_CERT, SERVER_KEY, "test123");
   Serial.printf("[Server] HTTPS on port 443\n");
   Serial.printf("Test: curl -k https://%s/api\n",
                 WiFi.localIP().toString().c_str());
-
-  // Optional: HTTP-to-HTTPS redirect
-  httpserver.onNotFound([](AsyncWebServerRequest *request) {
-    request->redirect("https://" + WiFi.localIP().toString() + request->url());
-  });
-  httpserver.begin();
-  Serial.printf("[Server] HTTP redirect on port 80\n");
 }
 
 void loop() {
