@@ -18,6 +18,7 @@ struct tcp_pcb;
 #define ASYNCTCP_TLS_EOF(r)         (((r) == MBEDTLS_ERR_SSL_CONN_EOF) || ((r) == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY))
 
 #define ASYNCTCP_TLS_RX_BUF_SIZE    4096
+#define ASYNCTCP_TLS_RX_BUF_MAX     16384
 #define ASYNCTCP_TLS_TX_BUF_SIZE    4096
 
 class AsyncTCPTLS
@@ -25,8 +26,13 @@ class AsyncTCPTLS
 private:
     mbedtls_ssl_context ssl_ctx;
     mbedtls_ssl_config ssl_conf;
-    mbedtls_ctr_drbg_context drbg_ctx;
-    mbedtls_entropy_context entropy_ctx;
+
+    // Shared across all instances — initialized once, RNG is serialized on async task
+    static mbedtls_ctr_drbg_context drbg_ctx;
+    static mbedtls_entropy_context entropy_ctx;
+    static bool _conf_initialized;
+
+    static void _init_rng(void);
 
     mbedtls_x509_crt ca_cert;
     mbedtls_x509_crt client_cert;
@@ -45,6 +51,7 @@ private:
 
     // Per-connection encrypted data buffers for BIO callbacks
     unsigned char *_ssl_rx_buf;
+    size_t _ssl_rx_buf_capacity;  // current allocation size (grows via realloc)
     size_t _ssl_rx_buf_len;
     size_t _ssl_rx_pos;
     size_t _ssl_rx_total;  // total bytes buffered, for tcp_recved()
@@ -52,8 +59,6 @@ private:
     unsigned char *_ssl_tx_buf;
     size_t _ssl_tx_buf_len;
     size_t _ssl_tx_pos;
-
-    bool _output_pending;  // tcp_write queued, tcp_output deferred
 
     int _startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const unsigned char *rootCABuff, const size_t rootCABuff_len,
@@ -70,8 +75,9 @@ public:
 
     static void _clear_DER_cache(void);
 
-    // Feed encrypted data from TCP into BIO buffer
-    void feedRxData(const unsigned char *data, size_t len);
+    // Feed encrypted data from TCP into BIO buffer (returns false if buffer full)
+    bool feedRxData(const unsigned char *data, size_t len);
+    size_t rxBufLen() const { return _ssl_rx_buf_len - _ssl_rx_pos; }
 
     // Flush BIO tx buffer to TCP (returns bytes flushed, 0 if nothing to flush)
     size_t flushTxData(void);
@@ -81,7 +87,6 @@ public:
 
     // Public accessor for PCB (needed by BIO callbacks)
     tcp_pcb *pcb() const { return _pcb; }
-    void setOutputPending(bool v) { _output_pending = v; }
 
     int startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip);
 
@@ -114,6 +119,9 @@ public:
 
     // Flush deferred tcp_output (called after mbedtls_ssl_handshake/write/read completes)
     void flushOutput(void);
+
+    // Send TLS close_notify alert and flush to TCP
+    void sendCloseNotify(void);
 };
 
 #endif // ASYNC_TCP_SSL_ENABLED

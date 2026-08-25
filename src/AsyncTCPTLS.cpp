@@ -19,7 +19,6 @@ extern "C" {
 #  warning "Please configure IDF framework to include mbedTLS -> Enable pre-shared-key ciphersuites and activate at least one cipher"
 #else
 
-static const char *pers = "esp32-tls";
 
 // From mbedtls/net_sockets.h — not included since we use custom LwIP BIO
 #ifndef MBEDTLS_ERR_NET_SEND_FAILED
@@ -45,6 +44,10 @@ void AsyncTCPTLS::_clear_DER_cache(void) {
 
 static int _handle_error(int err) {
     if (err == -30848) {
+        return err;
+    }
+    // Suppress connection reset — normal client disconnect
+    if (err == -0x004E) {
         return err;
     }
 #ifdef MBEDTLS_ERROR_C
@@ -73,12 +76,9 @@ typedef struct {
 static err_t _tcp_ssl_write_api(struct tcpip_api_call_data *api_call_msg) {
     ssl_tcp_api_call_t *msg = (ssl_tcp_api_call_t *)api_call_msg;
     msg->err = tcp_write(msg->pcb, msg->data, msg->size, msg->apiflags);
-    return msg->err;
-}
-
-static err_t _tcp_ssl_output_api(struct tcpip_api_call_data *api_call_msg) {
-    ssl_tcp_api_call_t *msg = (ssl_tcp_api_call_t *)api_call_msg;
-    msg->err = tcp_output(msg->pcb);
+    if (msg->err == ERR_OK) {
+        msg->err = tcp_output(msg->pcb);
+    }
     return msg->err;
 }
 
@@ -91,20 +91,6 @@ static err_t _tcp_ssl_write(tcp_pcb *pcb, const void *data, size_t size, uint8_t
     msg.apiflags = apiflags;
     msg.err = ERR_CONN;
     if (tcpip_api_call(_tcp_ssl_write_api, (struct tcpip_api_call_data *)&msg) != ERR_OK) {
-        return ERR_CONN;
-    }
-    return msg.err;
-}
-
-static err_t _tcp_ssl_output(tcp_pcb *pcb) {
-    if (!pcb) return ERR_CONN;
-    ssl_tcp_api_call_t msg;
-    msg.pcb = pcb;
-    msg.data = NULL;
-    msg.size = 0;
-    msg.apiflags = 0;
-    msg.err = ERR_CONN;
-    if (tcpip_api_call(_tcp_ssl_output_api, (struct tcpip_api_call_data *)&msg) != ERR_OK) {
         return ERR_CONN;
     }
     return msg.err;
@@ -125,7 +111,6 @@ static int _lwip_ssl_send(void *ctx, const unsigned char *buf, size_t len) {
 
     err_t err = _tcp_ssl_write(pcb, buf, len, TCP_WRITE_FLAG_COPY);
     if (err == ERR_OK) {
-        sslctx->setOutputPending(true);
         return (int)len;
     }
     if (err == ERR_MEM) {
@@ -146,11 +131,24 @@ static int _lwip_ssl_recv(void *ctx, unsigned char *buf, size_t len) {
  * AsyncTCPTLS implementation
  */
 
+// Static shared RNG — initialized once, serialized on async task
+mbedtls_ctr_drbg_context AsyncTCPTLS::drbg_ctx;
+mbedtls_entropy_context AsyncTCPTLS::entropy_ctx;
+bool AsyncTCPTLS::_conf_initialized = false;
+
+void AsyncTCPTLS::_init_rng(void) {
+    if (_conf_initialized) return;
+    mbedtls_ctr_drbg_init(&drbg_ctx);
+    mbedtls_entropy_init(&entropy_ctx);
+    mbedtls_ctr_drbg_seed(&drbg_ctx, mbedtls_entropy_func,
+                          &entropy_ctx, (const unsigned char *)"AsyncTCPTLS", 11);
+    _conf_initialized = true;
+}
+
 AsyncTCPTLS::AsyncTCPTLS(void) {
     mbedtls_ssl_init(&ssl_ctx);
     mbedtls_ssl_config_init(&ssl_conf);
-    mbedtls_ctr_drbg_init(&drbg_ctx);
-    mbedtls_entropy_init(&entropy_ctx);
+    _init_rng();
     _pcb = NULL;
     _ssl_key_password = NULL;
     _have_ca_cert = false;
@@ -160,6 +158,7 @@ AsyncTCPTLS::AsyncTCPTLS(void) {
     handshake_start_time = 0;
 
     _ssl_rx_buf = (unsigned char *)malloc(ASYNCTCP_TLS_RX_BUF_SIZE);
+    _ssl_rx_buf_capacity = _ssl_rx_buf ? ASYNCTCP_TLS_RX_BUF_SIZE : 0;
     _ssl_rx_buf_len = 0;
     _ssl_rx_pos = 0;
     _ssl_rx_total = 0;
@@ -167,7 +166,6 @@ AsyncTCPTLS::AsyncTCPTLS(void) {
     _ssl_tx_buf = (unsigned char *)malloc(ASYNCTCP_TLS_TX_BUF_SIZE);
     _ssl_tx_buf_len = 0;
     _ssl_tx_pos = 0;
-    _output_pending = false;
 }
 
 AsyncTCPTLS::~AsyncTCPTLS() {
@@ -177,8 +175,6 @@ AsyncTCPTLS::~AsyncTCPTLS() {
 
     mbedtls_ssl_free(&ssl_ctx);
     mbedtls_ssl_config_free(&ssl_conf);
-    mbedtls_ctr_drbg_free(&drbg_ctx);
-    mbedtls_entropy_free(&entropy_ctx);
 
     if (_ssl_key_password) {
         free(_ssl_key_password);
@@ -195,13 +191,36 @@ AsyncTCPTLS::~AsyncTCPTLS() {
     }
 }
 
-void AsyncTCPTLS::feedRxData(const unsigned char *data, size_t len) {
-    if (!_ssl_rx_buf || len == 0) return;
-    size_t space = ASYNCTCP_TLS_RX_BUF_SIZE - _ssl_rx_buf_len;
-    if (len > space) len = space;
+bool AsyncTCPTLS::feedRxData(const unsigned char *data, size_t len) {
+    if (!_ssl_rx_buf || len == 0) return true;
+
+    // Compact: move unconsumed data to front to reclaim space
+    if (_ssl_rx_pos > 0) {
+        size_t remaining = _ssl_rx_buf_len - _ssl_rx_pos;
+        if (remaining > 0) {
+            memmove(_ssl_rx_buf, _ssl_rx_buf + _ssl_rx_pos, remaining);
+        }
+        _ssl_rx_buf_len = remaining;
+        _ssl_rx_pos = 0;
+    }
+
+    // Check hard cap — if exceeded, caller must hold the pbuf
+    if (_ssl_rx_buf_len + len > ASYNCTCP_TLS_RX_BUF_MAX) {
+        return false;
+    }
+
+    // Grow buffer if needed (up to cap)
+    if (_ssl_rx_buf_len + len > _ssl_rx_buf_capacity) {
+        size_t need = _ssl_rx_buf_len + len;
+        unsigned char *newbuf = (unsigned char *)realloc(_ssl_rx_buf, need);
+        if (!newbuf) return false;
+        _ssl_rx_buf = newbuf;
+        _ssl_rx_buf_capacity = need;
+    }
     memcpy(_ssl_rx_buf + _ssl_rx_buf_len, data, len);
     _ssl_rx_buf_len += len;
     _ssl_rx_total += len;
+    return true;
 }
 
 size_t AsyncTCPTLS::flushTxData(void) {
@@ -211,7 +230,6 @@ size_t AsyncTCPTLS::flushTxData(void) {
     if (remaining > 0) {
         err_t err = _tcp_ssl_write(_pcb, _ssl_tx_buf + _ssl_tx_pos, remaining, TCP_WRITE_FLAG_COPY);
         if (err == ERR_OK) {
-            _tcp_ssl_output(_pcb);
             sent = remaining;
             _ssl_tx_buf_len = 0;
             _ssl_tx_pos = 0;
@@ -219,9 +237,9 @@ size_t AsyncTCPTLS::flushTxData(void) {
             // TCP buffer full, try to send what we can
             size_t space = tcp_sndbuf(_pcb);
             if (space > 0) {
+                if (space > remaining) space = remaining;
                 err_t err2 = _tcp_ssl_write(_pcb, _ssl_tx_buf + _ssl_tx_pos, space, TCP_WRITE_FLAG_COPY);
                 if (err2 == ERR_OK) {
-                    _tcp_ssl_output(_pcb);
                     sent = space;
                     _ssl_tx_pos += space;
                 }
@@ -290,14 +308,6 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
 
     if (!pcb) {
         return -1;
-    }
-
-    async_tcp_log_v("Seeding the random number generator");
-
-    ret = mbedtls_ctr_drbg_seed(&drbg_ctx, mbedtls_entropy_func,
-                                &entropy_ctx, (const unsigned char *)pers, strlen(pers));
-    if (ret < 0) {
-        return handle_error(ret);
     }
 
     async_tcp_log_v("Setting up the SSL/TLS structure...");
@@ -422,12 +432,6 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
     _ssl_key_password = password ? strdup(password) : NULL;
 
     async_tcp_log_v("Seeding the random number generator (server)");
-
-    ret = mbedtls_ctr_drbg_seed(&drbg_ctx, mbedtls_entropy_func,
-                                &entropy_ctx, (const unsigned char *)pers, strlen(pers));
-    if (ret < 0) {
-        return handle_error(ret);
-    }
 
     async_tcp_log_v("Setting up the SSL/TLS structure (server)...");
 
@@ -650,20 +654,28 @@ int AsyncTCPTLS::sslRead(uint8_t *data, size_t len) {
 }
 
 void AsyncTCPTLS::flushOutput(void) {
-    if (_output_pending && _pcb) {
-        _tcp_ssl_output(_pcb);
-        _output_pending = false;
+    // No-op: tcp_output is now inlined in _tcp_ssl_write
+}
+
+void AsyncTCPTLS::sendCloseNotify(void) {
+    if (!_pcb) return;
+    int ret = mbedtls_ssl_close_notify(&ssl_ctx);
+    flushOutput();
+    if (ret != 0) {
+        async_tcp_log_d("close_notify: %d", ret);
     }
 }
 
 void AsyncTCPTLS::_deleteHandshakeCerts(void) {
     if (_have_ca_cert) {
         async_tcp_log_v("Cleaning CA certificate.");
+        mbedtls_ssl_conf_ca_chain(&ssl_conf, NULL, NULL);
         mbedtls_x509_crt_free(&ca_cert);
         _have_ca_cert = false;
     }
     if (_have_client_cert) {
         async_tcp_log_v("Cleaning client certificate.");
+        mbedtls_ssl_conf_own_cert(&ssl_conf, NULL, NULL);
         mbedtls_x509_crt_free(&client_cert);
         _have_client_cert = false;
     }

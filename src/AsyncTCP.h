@@ -284,7 +284,7 @@ public:
 
 #if ASYNC_TCP_SSL_ENABLED
   // SSL support
-  bool beginSecure(const char *host, uint16_t port, const char *rootCA = NULL,
+  bool beginSecure(const char *host, uint16_t port, const char *rootCA,
       const char *clientCert = NULL, const char *clientKey = NULL);
   bool beginSecure(const char *host, uint16_t port,
       const unsigned char *rootCA, size_t rootCALen,
@@ -355,6 +355,7 @@ protected:
   const unsigned char *_ssl_client_key;
   size_t _ssl_client_key_len;
   void _clearSSLParams(void);
+  pbuf *_ssl_pending_pbufs;
 #endif
 };
 

@@ -657,8 +657,9 @@ static err_t _tcp_close_api(struct tcpip_api_call_data *api_call_msg) {
     tcp_pcb *pcb = *msg->pcb;
     _reset_tcp_callbacks(pcb, msg->close);
     if (tcp_close(pcb) != ERR_OK) {
-      // We do not permit failure here: abandon the pcb anyways.
-      tcp_abort(pcb);
+      // tcp_close fails when unsent data remains (e.g. HTTP response not yet ACKed).
+      // Send FIN gracefully instead of RST to avoid NS_ERROR_NET_RESET.
+      tcp_shutdown(pcb, 0, 1);
     }
     msg->err = ERR_OK;
     *msg->pcb = nullptr;  // PCB is now the property of LwIP
@@ -791,6 +792,7 @@ AsyncClient::AsyncClient(tcp_pcb *pcb)
   _ssl_client_cert_len = 0;
   _ssl_client_key = 0;
   _ssl_client_key_len = 0;
+  _ssl_pending_pbufs = NULL;
 #endif
   if (_pcb) {
     _rx_last_packet = millis();
@@ -800,6 +802,10 @@ AsyncClient::AsyncClient(tcp_pcb *pcb)
 
 AsyncClient::~AsyncClient() {
 #if ASYNC_TCP_SSL_ENABLED
+  if (_ssl_pending_pbufs) {
+    pbuf_free(_ssl_pending_pbufs);
+    _ssl_pending_pbufs = NULL;
+  }
   if (_ssl_ctx) {
     delete _ssl_ctx;
     _ssl_ctx = 0;
@@ -1127,7 +1133,14 @@ void AsyncClient::ackPacket(struct pbuf *pb) {
 int8_t AsyncClient::_close() {
   // ets_printf("X: 0x%08x\n", (uint32_t)this);
 #if ASYNC_TCP_SSL_ENABLED
+  if (_ssl_pending_pbufs) {
+    pbuf_free(_ssl_pending_pbufs);
+    _ssl_pending_pbufs = NULL;
+  }
   if (_ssl_ctx) {
+    // Do NOT call sendCloseNotify() here — it queues data via tcp_write(),
+    // which causes tcp_close() to always fail (unsent data), forcing the
+    // fallback to tcp_shutdown() that leaks PCBs in FIN_WAIT/LAST_ACK.
     delete _ssl_ctx;
     _ssl_ctx = 0;
     _ssl_handshake_done = false;
@@ -1241,6 +1254,10 @@ int8_t AsyncClient::_lwip_fin(tcp_pcb *pcb, int8_t err) {
 // In Async Thread
 int8_t AsyncClient::_fin(tcp_pcb *pcb, int8_t err) {
 #if ASYNC_TCP_SSL_ENABLED
+  if (_ssl_pending_pbufs) {
+    pbuf_free(_ssl_pending_pbufs);
+    _ssl_pending_pbufs = NULL;
+  }
   if (_ssl_ctx) {
     delete _ssl_ctx;
     _ssl_ctx = 0;
@@ -1262,17 +1279,25 @@ int8_t AsyncClient::_sent(tcp_pcb *pcb, uint16_t len) {
 int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
 #if ASYNC_TCP_SSL_ENABLED
   if (_ssl_ctx && !_ssl_handshake_done) {
-    // During handshake: feed all received data into SSL rx buffer
+    // During handshake: buffer encrypted data, ack full pbuf size to TCP
+    // (LwIP requires exact ack — pbufs already removed from receive queue)
+    size_t total_recved = 0;
     while (pb != NULL) {
       _rx_last_packet = millis();
+      if (!_ssl_ctx->feedRxData((const unsigned char *)pb->payload, pb->len)) {
+        // BIO buffer full — hold remaining pbufs without acking
+        // LwIP backpressures naturally via TCP window
+        _ssl_pending_pbufs = pb;
+        break;
+      }
       pbuf *b = pb;
       pb = b->next;
       b->next = NULL;
-      _ssl_ctx->feedRxData((const unsigned char *)b->payload, b->len);
-      if (_pcb) {
-        _tcp_recved(&_pcb, b->len);
-      }
+      total_recved += b->len;
       pbuf_free(b);
+    }
+    if (total_recved > 0 && _pcb) {
+      _tcp_recved(&_pcb, total_recved);
     }
     // Try to continue handshake
     int ret = _ssl_ctx->runSSLHandshake();
@@ -1298,18 +1323,23 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
   }
 
   if (_ssl_ctx && _ssl_handshake_done) {
-    // SSL established: feed encrypted data, decrypt, deliver plaintext
+    // SSL established: buffer encrypted data, ack full pbuf size to TCP
+    size_t total_recved = 0;
     while (pb != NULL) {
       _rx_last_packet = millis();
+      if (!_ssl_ctx->feedRxData((const unsigned char *)pb->payload, pb->len)) {
+        // BIO buffer full — hold remaining pbufs without acking
+        _ssl_pending_pbufs = pb;
+        break;
+      }
       pbuf *b = pb;
       pb = b->next;
       b->next = NULL;
-      _ssl_ctx->feedRxData((const unsigned char *)b->payload, b->len);
-      // Ack data to TCP immediately — it's now buffered in the SSL context
-      if (_pcb) {
-        _tcp_recved(&_pcb, b->len);
-      }
+      total_recved += b->len;
       pbuf_free(b);
+    }
+    if (total_recved > 0 && _pcb) {
+      _tcp_recved(&_pcb, total_recved);
     }
     // Decrypt all available plaintext
     uint8_t buf[1024];
@@ -1387,6 +1417,39 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
       _close();
     }
     return ERR_OK;
+  }
+
+  // Process pending SSL pbufs — drain BIO buffer first to make room
+  if (_ssl_pending_pbufs && _ssl_ctx && _ssl_handshake_done) {
+    uint8_t buf[1024];
+    int n;
+    while ((n = _ssl_ctx->sslRead(buf, sizeof(buf))) > 0) {
+      if (_recv_cb) {
+        async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, buf, n));
+      }
+    }
+    _ssl_ctx->flushOutput();
+
+    // Try to feed held pbufs now that BIO buffer has drained
+    pbuf *pb = _ssl_pending_pbufs;
+    _ssl_pending_pbufs = NULL;
+    size_t total_recved = 0;
+    while (pb != NULL) {
+      _rx_last_packet = millis();
+      if (!_ssl_ctx->feedRxData((const unsigned char *)pb->payload, pb->len)) {
+        // Still no room — save rest for next poll
+        _ssl_pending_pbufs = pb;
+        break;
+      }
+      pbuf *b = pb;
+      pb = b->next;
+      b->next = NULL;
+      total_recved += b->len;
+      pbuf_free(b);
+    }
+    if (total_recved > 0 && _pcb) {
+      _tcp_recved(&_pcb, total_recved);
+    }
   }
 #endif
 
@@ -1918,50 +1981,22 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
 
 int8_t AsyncServer::_accepted(AsyncClient *client) {
 #if ASYNC_TCP_SSL_ENABLED
-  if (_use_ssl && client && client->pcb()) {
-    const unsigned char *cert = _cert;
-    size_t cert_len = _cert_len;
-    const unsigned char *key = _key;
-    size_t key_len = _key_len;
-    uint8_t *cb_cert = NULL;
-    uint8_t *cb_key = NULL;
-
-    // If cert/key not pre-loaded, try the file handler callback
-    if (!cert && !key && _ssl_file_cb) {
-      int r = _ssl_file_cb(_ssl_file_cb_arg, &cb_cert, &cb_key);
-      if (r == 0) {
-        if (cb_cert) { cert = cb_cert; cert_len = strlen((const char *)cb_cert) + 1; }
-        if (cb_key) { key = cb_key; key_len = strlen((const char *)cb_key) + 1; }
-      }
-    }
-
-    if (cert && key) {
-      AsyncTCPTLS *ssl = new (std::nothrow) AsyncTCPTLS();
-      if (ssl) {
-        int ret = ssl->startSSLServer(client->pcb(), cert, cert_len, key, key_len, _ssl_key_password);
-        if (ret == 0) {
-          client->_ssl_ctx = ssl;
-          async_tcp_log_d("Server SSL context ready, handshake will start on first poll");
-        } else {
-          async_tcp_log_e("startSSLServer failed: %d", ret);
-          delete ssl;
-          client->abort();
-          if (cb_cert) free(cb_cert);
-          if (cb_key) free(cb_key);
-          return ERR_ABRT;
-        }
+  if (_use_ssl && _cert && _key && client && client->pcb()) {
+    AsyncTCPTLS *ssl = new (std::nothrow) AsyncTCPTLS();
+    if (ssl) {
+      int ret = ssl->startSSLServer(client->pcb(), _cert, _cert_len, _key, _key_len, _ssl_key_password);
+      if (ret == 0) {
+        client->_ssl_ctx = ssl;
+        async_tcp_log_d("Server SSL context ready, handshake will start on first poll");
       } else {
-        async_tcp_log_e("Failed to allocate SSL context for server");
+        async_tcp_log_e("startSSLServer failed: %d", ret);
+        delete ssl;
         client->abort();
-        if (cb_cert) free(cb_cert);
-        if (cb_key) free(cb_key);
         return ERR_ABRT;
       }
     } else {
-      async_tcp_log_e("SSL enabled but no certificate available");
+      async_tcp_log_e("Failed to allocate SSL context for server");
       client->abort();
-      if (cb_cert) free(cb_cert);
-      if (cb_key) free(cb_key);
       return ERR_ABRT;
     }
   }
