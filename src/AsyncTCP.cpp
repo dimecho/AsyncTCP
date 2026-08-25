@@ -1925,9 +1925,13 @@ int8_t AsyncServer::_accepted(AsyncClient *client) {
       } else {
         async_tcp_log_e("startSSLServer failed: %d", ret);
         delete ssl;
+        client->abort();
+        return ERR_ABRT;
       }
     } else {
       async_tcp_log_e("Failed to allocate SSL context for server");
+      client->abort();
+      return ERR_ABRT;
     }
   }
 #endif
