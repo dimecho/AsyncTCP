@@ -78,8 +78,6 @@ public:
     AsyncTCPTLS(void);
     virtual ~AsyncTCPTLS();
 
-    static void _clear_DER_cache(void);
-
     // Feed encrypted data from TCP into BIO buffer (returns false if buffer full)
     bool feedRxData(const unsigned char *data, size_t len);
     size_t rxBufLen() const { return _ssl_rx_buf_len - _ssl_rx_pos; }
@@ -97,8 +95,10 @@ public:
 
     int startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip);
 
+#if defined(MBEDTLS_KEY_EXCHANGE__SOME__PSK_ENABLED) || defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
     int startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const char *pskIdent, const char *psKey);
+#endif
 
     int startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const char *rootCABuff,

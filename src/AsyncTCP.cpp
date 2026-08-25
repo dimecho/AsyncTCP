@@ -1925,9 +1925,6 @@ void AsyncServer::end() {
     }
     _pcb = NULL;
   }
-#if ASYNC_TCP_SSL_ENABLED
-  AsyncTCPTLS::_clear_DER_cache();
-#endif
 }
 
 // runs on LwIP thread

@@ -16,27 +16,14 @@ extern "C" {
 
 #if ASYNC_TCP_SSL_ENABLED
 #if !defined(MBEDTLS_KEY_EXCHANGE__SOME__PSK_ENABLED) && !defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
-#  warning "Please configure IDF framework to include mbedTLS -> Enable pre-shared-key ciphersuites and activate at least one cipher"
-#else
+#  warning "PSK ciphersuites not configured — PSK TLS overloads will be unavailable"
+#endif
 
 
 // From mbedtls/net_sockets.h — not included since we use custom LwIP BIO
 #ifndef MBEDTLS_ERR_NET_SEND_FAILED
 #define MBEDTLS_ERR_NET_SEND_FAILED -0x004E
 #endif
-
-// DER cache — PEM parsed once, reused for all server connections
-static unsigned char *_cached_cert_der = NULL;
-static size_t _cached_cert_der_len = 0;
-static unsigned char *_cached_key_der = NULL;
-static size_t _cached_key_der_len = 0;
-
-void AsyncTCPTLS::_clear_DER_cache(void) {
-    if (_cached_cert_der) { free(_cached_cert_der); _cached_cert_der = NULL; }
-    _cached_cert_der_len = 0;
-    if (_cached_key_der) { free(_cached_key_der); _cached_key_der = NULL; }
-    _cached_key_der_len = 0;
-}
 
 static int _handle_error(int err) {
     if (err == -30848) {
@@ -295,6 +282,7 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
             return handle_error(ret);
         }
     } else if (pskIdent != NULL && psKey != NULL) {
+#if defined(MBEDTLS_KEY_EXCHANGE__SOME__PSK_ENABLED) || defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
         async_tcp_log_v("Setting up PSK");
         if ((strlen(psKey) & 1) != 0 || strlen(psKey) > 2 * MBEDTLS_PSK_MAX_LEN) {
             async_tcp_log_e("pre-shared key not valid hex or too long");
@@ -323,6 +311,10 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
             async_tcp_log_e("mbedtls_ssl_conf_psk returned %d", ret);
             return handle_error(ret);
         }
+#else
+        async_tcp_log_e("PSK ciphersuites not enabled in mbedTLS config");
+        return -1;
+#endif
     } else {
         return -1;
     }
@@ -424,29 +416,36 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
     // Self-signed cert — no client certificate verification
     mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
 
-    // Load server certificate — use DER cache if available
+    // Load server certificate
     mbedtls_x509_crt_init(&client_cert);
 
-    if (_cached_cert_der != NULL) {
-        async_tcp_log_v("Using cached cert DER (%u bytes)", (unsigned)_cached_cert_der_len);
-        ret = mbedtls_x509_crt_parse(&client_cert, _cached_cert_der, _cached_cert_der_len);
-    } else {
-        async_tcp_log_v("Parsing cert PEM -> DER (first connection, will cache)");
+    if (server_cert_len >= 11 && memcmp(server_cert, "-----BEGIN ", 11) == 0) {
+        // PEM — make a NUL-terminated copy (mbedtls_pem_read_buffer requires it)
+        async_tcp_log_v("Parsing cert PEM (%u bytes)", (unsigned)server_cert_len);
+        char *pem_buf = (char *)malloc(server_cert_len + 1);
+        if (!pem_buf) {
+            _deleteHandshakeCerts();
+            return handle_error(MBEDTLS_ERR_SSL_ALLOC_FAILED);
+        }
+        memcpy(pem_buf, server_cert, server_cert_len);
+        pem_buf[server_cert_len] = '\0';
         mbedtls_pem_context pem;
         mbedtls_pem_init(&pem);
         size_t use_len = 0;
+        size_t cert_der_len = 0;
         ret = mbedtls_pem_read_buffer(&pem,
             "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----",
-            server_cert, NULL, 0, &use_len);
+            (const unsigned char *)pem_buf, NULL, 0, &use_len);
         if (ret == 0) {
-            const unsigned char *der_buf = mbedtls_pem_get_buffer(&pem, &_cached_cert_der_len);
-            _cached_cert_der = (unsigned char *)malloc(_cached_cert_der_len);
-            if (_cached_cert_der) {
-                memcpy(_cached_cert_der, der_buf, _cached_cert_der_len);
-            }
-            ret = mbedtls_x509_crt_parse(&client_cert, der_buf, _cached_cert_der_len);
+            const unsigned char *der_buf = mbedtls_pem_get_buffer(&pem, &cert_der_len);
+            ret = mbedtls_x509_crt_parse(&client_cert, der_buf, cert_der_len);
         }
         mbedtls_pem_free(&pem);
+        free(pem_buf);
+    } else {
+        // DER — parse directly with length
+        async_tcp_log_v("Parsing cert DER (%u bytes)", (unsigned)server_cert_len);
+        ret = mbedtls_x509_crt_parse(&client_cert, server_cert, server_cert_len);
     }
     _have_client_cert = true;
     if (ret < 0) {
@@ -454,28 +453,31 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
         return handle_error(ret);
     }
 
-    // Load server private key — use DER cache if available
+    // Load server private key
     mbedtls_pk_init(&client_key);
 
-    if (_cached_key_der != NULL) {
-        async_tcp_log_v("Using cached key DER (%u bytes)", (unsigned)_cached_key_der_len);
-        const unsigned char *pwd = (const unsigned char *)_ssl_key_password;
-        size_t pwd_len = _ssl_key_password ? strlen(_ssl_key_password) : 0;
-        ret = mbedtls_pk_parse_key(&client_key, _cached_key_der, _cached_key_der_len,
-            pwd, pwd_len, mbedtls_ctr_drbg_random, &drbg_ctx);
-    } else {
-        async_tcp_log_v("Parsing key PEM -> DER (first connection, will cache)");
+    if (server_key_len >= 11 && memcmp(server_key, "-----BEGIN ", 11) == 0) {
+        // PEM — make a NUL-terminated copy
+        async_tcp_log_v("Parsing key PEM (%u bytes)", (unsigned)server_key_len);
+        char *pem_buf = (char *)malloc(server_key_len + 1);
+        if (!pem_buf) {
+            _deleteHandshakeCerts();
+            return handle_error(MBEDTLS_ERR_SSL_ALLOC_FAILED);
+        }
+        memcpy(pem_buf, server_key, server_key_len);
+        pem_buf[server_key_len] = '\0';
         mbedtls_pem_context pem;
         mbedtls_pem_init(&pem);
         size_t use_len = 0;
+        size_t key_der_len = 0;
         const unsigned char *pwd = (const unsigned char *)_ssl_key_password;
         size_t pwd_len = _ssl_key_password ? strlen(_ssl_key_password) : 0;
 
         const char *key_header, *key_footer;
-        if (strncmp((const char *)server_key, "-----BEGIN ENCRYPTED PRIVATE KEY-----", 37) == 0) {
+        if (strncmp(pem_buf, "-----BEGIN ENCRYPTED PRIVATE KEY-----", 37) == 0) {
             key_header = "-----BEGIN ENCRYPTED PRIVATE KEY-----";
             key_footer = "-----END ENCRYPTED PRIVATE KEY-----";
-        } else if (strncmp((const char *)server_key, "-----BEGIN PRIVATE KEY-----", 27) == 0) {
+        } else if (strncmp(pem_buf, "-----BEGIN PRIVATE KEY-----", 27) == 0) {
             key_header = "-----BEGIN PRIVATE KEY-----";
             key_footer = "-----END PRIVATE KEY-----";
         } else {
@@ -483,17 +485,19 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
             key_footer = "-----END RSA PRIVATE KEY-----";
         }
         ret = mbedtls_pem_read_buffer(&pem, key_header, key_footer,
-            server_key, pwd, pwd_len, &use_len);
+            (const unsigned char *)pem_buf, pwd, pwd_len, &use_len);
         if (ret == 0) {
-            const unsigned char *der_buf = mbedtls_pem_get_buffer(&pem, &_cached_key_der_len);
-            _cached_key_der = (unsigned char *)malloc(_cached_key_der_len);
-            if (_cached_key_der) {
-                memcpy(_cached_key_der, der_buf, _cached_key_der_len);
-            }
-            ret = mbedtls_pk_parse_key(&client_key, der_buf, _cached_key_der_len,
-                NULL, 0, mbedtls_ctr_drbg_random, &drbg_ctx);
+            const unsigned char *der_buf = mbedtls_pem_get_buffer(&pem, &key_der_len);
+            ret = mbedtls_pk_parse_key(&client_key, der_buf, key_der_len,
+                pwd, pwd_len, mbedtls_ctr_drbg_random, &drbg_ctx);
         }
         mbedtls_pem_free(&pem);
+        free(pem_buf);
+    } else {
+        // DER — parse directly with length
+        async_tcp_log_v("Parsing key DER (%u bytes)", (unsigned)server_key_len);
+        ret = mbedtls_pk_parse_key(&client_key, server_key, server_key_len,
+            NULL, 0, mbedtls_ctr_drbg_random, &drbg_ctx);
     }
     _have_client_key = true;
     if (ret != 0) {
@@ -560,14 +564,12 @@ int AsyncTCPTLS::runSSLHandshake(void) {
             async_tcp_log_v("Certificate verification was skipped (expected for self-signed server): %s", buf);
         } else {
             async_tcp_log_e("Failed to verify peer certificate! verification info: %s", buf);
-            _deleteHandshakeCerts();
             return handle_error(-1);
         }
     } else {
         async_tcp_log_v("Certificate verified.");
     }
 
-    _deleteHandshakeCerts();
     async_tcp_log_v("Free internal heap after TLS %u", ESP.getFreeHeap());
 
     return 0;
@@ -660,5 +662,4 @@ void AsyncTCPTLS::_deleteHandshakeCerts(void) {
     }
 }
 
-#endif
 #endif // ASYNC_TCP_SSL_ENABLED

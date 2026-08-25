@@ -7,7 +7,7 @@
 #include "AsyncTCPVersion.h"
 #define ASYNCTCP_FORK_ESP32Async
 
-// SSL support — default enabled, set to 0 before including this header to disable
+// SSL support — default disabled; define as 1 globally at build time to enable
 #ifndef ASYNC_TCP_SSL_ENABLED
 #define ASYNC_TCP_SSL_ENABLED 0
 #endif
