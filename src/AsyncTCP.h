@@ -73,8 +73,7 @@ class AsyncClient;
 #define ASYNC_WRITE_FLAG_MORE 0x02  // will not send PSH flag, meaning that there should be more data to be sent before the application should react.
 
 #if ASYNC_TCP_SSL_ENABLED
-#define SSL_HANDSHAKE_TIMEOUT 10000
-class AsyncTCPTLS;
+#include "AsyncTCPTLS.h"
 #endif
 
 typedef std::function<void(void *, AsyncClient *)> AcConnectHandler;

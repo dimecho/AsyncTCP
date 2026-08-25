@@ -1977,6 +1977,18 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
 int8_t AsyncServer::_accepted(AsyncClient *client) {
 #if ASYNC_TCP_SSL_ENABLED
   if (_use_ssl && _cert && _key && client && client->pcb()) {
+    if (AsyncTCPTLS::getActiveCount() >= SSL_MAX_CONNECTIONS) {
+      async_tcp_log_e("SSL connection limit reached (%d/%d)", AsyncTCPTLS::getActiveCount(), SSL_MAX_CONNECTIONS);
+      client->abort();
+      delete client;
+      return ERR_ABRT;
+    }
+    if (ESP.getFreeHeap() < 10000) {
+      async_tcp_log_e("SSL rejected: low heap (%u bytes)", ESP.getFreeHeap());
+      client->abort();
+      delete client;
+      return ERR_ABRT;
+    }
     AsyncTCPTLS *ssl = new (std::nothrow) AsyncTCPTLS();
     if (ssl) {
       int ret = ssl->startSSLServer(client->pcb(), _cert, _cert_len, _key, _key_len, _ssl_key_password);
@@ -1987,11 +1999,13 @@ int8_t AsyncServer::_accepted(AsyncClient *client) {
         async_tcp_log_e("startSSLServer failed: %d", ret);
         delete ssl;
         client->abort();
+        delete client;
         return ERR_ABRT;
       }
     } else {
       async_tcp_log_e("Failed to allocate SSL context for server");
       client->abort();
+      delete client;
       return ERR_ABRT;
     }
   }

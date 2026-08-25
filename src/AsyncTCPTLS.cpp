@@ -25,10 +25,6 @@ extern "C" {
 #define MBEDTLS_ERR_NET_SEND_FAILED -0x004E
 #endif
 
-#ifndef SSL_HANDSHAKE_TIMEOUT
-#define SSL_HANDSHAKE_TIMEOUT 10000
-#endif
-
 // DER cache — PEM parsed once, reused for all server connections
 static unsigned char *_cached_cert_der = NULL;
 static size_t _cached_cert_der_len = 0;
@@ -135,6 +131,7 @@ static int _lwip_ssl_recv(void *ctx, unsigned char *buf, size_t len) {
 mbedtls_ctr_drbg_context AsyncTCPTLS::drbg_ctx;
 mbedtls_entropy_context AsyncTCPTLS::entropy_ctx;
 bool AsyncTCPTLS::_conf_initialized = false;
+int AsyncTCPTLS::_active_count = 0;
 
 void AsyncTCPTLS::_init_rng(void) {
     if (_conf_initialized) return;
@@ -154,13 +151,15 @@ AsyncTCPTLS::AsyncTCPTLS(void) {
     _have_ca_cert = false;
     _have_client_cert = false;
     _have_client_key = false;
-    handshake_timeout = 120000;
+    handshake_timeout = SSL_HANDSHAKE_TIMEOUT;
     handshake_start_time = 0;
 
     _ssl_rx_buf = (unsigned char *)malloc(ASYNCTCP_TLS_RX_BUF_SIZE);
     _ssl_rx_buf_capacity = _ssl_rx_buf ? ASYNCTCP_TLS_RX_BUF_SIZE : 0;
     _ssl_rx_buf_len = 0;
     _ssl_rx_pos = 0;
+
+    _active_count++;
 }
 
 AsyncTCPTLS::~AsyncTCPTLS() {
@@ -180,6 +179,8 @@ AsyncTCPTLS::~AsyncTCPTLS() {
         free(_ssl_rx_buf);
         _ssl_rx_buf = NULL;
     }
+
+    _active_count--;
 }
 
 bool AsyncTCPTLS::feedRxData(const unsigned char *data, size_t len) {

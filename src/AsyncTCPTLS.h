@@ -18,7 +18,15 @@ struct tcp_pcb;
 #define ASYNCTCP_TLS_EOF(r)         (((r) == MBEDTLS_ERR_SSL_CONN_EOF) || ((r) == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY))
 
 #define ASYNCTCP_TLS_RX_BUF_SIZE    4096
-#define ASYNCTCP_TLS_RX_BUF_MAX     16384
+#define ASYNCTCP_TLS_RX_BUF_MAX     8192
+
+#ifndef SSL_HANDSHAKE_TIMEOUT
+#define SSL_HANDSHAKE_TIMEOUT 10000
+#endif
+
+#ifndef SSL_MAX_CONNECTIONS
+#define SSL_MAX_CONNECTIONS 4
+#endif
 
 class AsyncTCPTLS
 {
@@ -30,6 +38,9 @@ private:
     static mbedtls_ctr_drbg_context drbg_ctx;
     static mbedtls_entropy_context entropy_ctx;
     static bool _conf_initialized;
+
+    // Concurrent connection tracking
+    static int _active_count;
 
     static void _init_rng(void);
 
@@ -81,6 +92,8 @@ public:
 
     // Diagnostic: log BIO buffer state
     void logBioState(const char *tag) const;
+
+    static int getActiveCount() { return _active_count; }
 
     int startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip);
 
