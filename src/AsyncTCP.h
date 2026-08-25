@@ -284,11 +284,13 @@ public:
 #if ASYNC_TCP_SSL_ENABLED
   // SSL support
   bool beginSecure(const char *host, uint16_t port, const char *rootCA,
-      const char *clientCert = NULL, const char *clientKey = NULL);
+      const char *clientCert = NULL, const char *clientKey = NULL,
+      const char *keyPassword = NULL);
   bool beginSecure(const char *host, uint16_t port,
       const unsigned char *rootCA, size_t rootCALen,
       const unsigned char *clientCert = NULL, size_t clientCertLen = 0,
-      const unsigned char *clientKey = NULL, size_t clientKeyLen = 0);
+      const unsigned char *clientKey = NULL, size_t clientKeyLen = 0,
+      const char *keyPassword = NULL);
   bool ssl() const { return _ssl_ctx != 0; }
   void setSSLReceiveTimeout(uint32_t timeout) { _ssl_timeout = timeout; }
   uint32_t getSSLReceiveTimeout() const { return _ssl_timeout; }
@@ -352,6 +354,7 @@ protected:
   size_t _ssl_client_cert_len;
   const unsigned char *_ssl_client_key;
   size_t _ssl_client_key_len;
+  char *_ssl_key_password;
   void _clearSSLParams(void);
   pbuf *_ssl_pending_pbufs;
 #endif

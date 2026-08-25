@@ -792,6 +792,7 @@ AsyncClient::AsyncClient(tcp_pcb *pcb)
   _ssl_client_cert_len = 0;
   _ssl_client_key = 0;
   _ssl_client_key_len = 0;
+  _ssl_key_password = NULL;
   _ssl_pending_pbufs = NULL;
 #endif
   if (_pcb) {
@@ -810,6 +811,7 @@ AsyncClient::~AsyncClient() {
     delete _ssl_ctx;
     _ssl_ctx = 0;
   }
+  if (_ssl_key_password) { free(_ssl_key_password); _ssl_key_password = NULL; }
 #endif
   if (_pcb) {
     _close();
@@ -973,20 +975,23 @@ void AsyncClient::_clearSSLParams(void) {
   _ssl_client_cert_len = 0;
   _ssl_client_key = NULL;
   _ssl_client_key_len = 0;
+  if (_ssl_key_password) { free(_ssl_key_password); _ssl_key_password = NULL; }
 }
 
 bool AsyncClient::beginSecure(const char *host, uint16_t port, const char *rootCA,
-    const char *clientCert, const char *clientKey) {
+    const char *clientCert, const char *clientKey, const char *keyPassword) {
   return beginSecure(host, port,
       (const unsigned char *)rootCA, (rootCA != NULL) ? strlen(rootCA) + 1 : 0,
       (const unsigned char *)clientCert, (clientCert != NULL) ? strlen(clientCert) + 1 : 0,
-      (const unsigned char *)clientKey, (clientKey != NULL) ? strlen(clientKey) + 1 : 0);
+      (const unsigned char *)clientKey, (clientKey != NULL) ? strlen(clientKey) + 1 : 0,
+      keyPassword);
 }
 
 bool AsyncClient::beginSecure(const char *host, uint16_t port,
     const unsigned char *rootCA, size_t rootCALen,
     const unsigned char *clientCert, size_t clientCertLen,
-    const unsigned char *clientKey, size_t clientKeyLen) {
+    const unsigned char *clientKey, size_t clientKeyLen,
+    const char *keyPassword) {
   if (_ssl_ctx) {
     async_tcp_log_d("already have SSL context");
     return false;
@@ -999,6 +1004,8 @@ bool AsyncClient::beginSecure(const char *host, uint16_t port,
   _ssl_client_cert_len = clientCertLen;
   _ssl_client_key = clientKey;
   _ssl_client_key_len = clientKeyLen;
+  if (_ssl_key_password) { free(_ssl_key_password); _ssl_key_password = NULL; }
+  _ssl_key_password = keyPassword ? strdup(keyPassword) : NULL;
   return connect(host, port);
 }
 
@@ -1175,10 +1182,16 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
       }
       return ERR_ABRT;
     }
-    int ret = _ssl_ctx->startSSLClient(_pcb, _ssl_host.c_str(),
-        _ssl_ca_cert, _ssl_ca_cert_len,
-        _ssl_client_cert, _ssl_client_cert_len,
-        _ssl_client_key, _ssl_client_key_len);
+    int ret;
+    if (_ssl_ca_cert == NULL) {
+      ret = _ssl_ctx->startSSLClientInsecure(_pcb, _ssl_host.c_str());
+    } else {
+      ret = _ssl_ctx->startSSLClient(_pcb, _ssl_host.c_str(),
+          _ssl_ca_cert, _ssl_ca_cert_len,
+          _ssl_client_cert, _ssl_client_cert_len,
+          _ssl_client_key, _ssl_client_key_len,
+          _ssl_key_password);
+    }
     if (ret != 0) {
       async_tcp_log_e("startSSLClient failed: %d", ret);
       delete _ssl_ctx;

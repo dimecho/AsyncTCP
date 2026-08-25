@@ -43,6 +43,9 @@ jobs:
       - name: WebServerSSL
         run: arduino-cli --config-file ${{ matrix.config }} --library ./src/ compile --fqbn esp32:esp32:esp32 --build-property "compiler.cpp.extra_flags=-DASYNC_TCP_SSL_ENABLED=1" ./examples/WebServerSSL/WebServerSSL.ino
 
+      - name: ClientSSL
+        run: arduino-cli --config-file ${{ matrix.config }} --library ./src/ compile --fqbn esp32:esp32:esp32 --build-property "compiler.cpp.extra_flags=-DASYNC_TCP_SSL_ENABLED=1" ./examples/ClientSSL/ClientSSL.ino
+
   platformio:
     name: "pio:${{ matrix.env }}:${{ matrix.board }}"
     runs-on: ubuntu-latest
@@ -106,6 +109,8 @@ jobs:
       - run: PLATFORMIO_SRC_DIR=examples/FetchWebsite PIO_BOARD=${{ matrix.board }} pio run -e ${{ matrix.env }}
       - if: startsWith(matrix.env, 'ci-arduino-3')
         run: PLATFORMIO_SRC_DIR=examples/WebServerSSL PIO_BOARD=${{ matrix.board }} pio run -e ci-arduino-3-ssl
+      - if: startsWith(matrix.env, 'ci-arduino-3')
+        run: PLATFORMIO_SRC_DIR=examples/ClientSSL PIO_BOARD=${{ matrix.board }} pio run -e ci-arduino-3-ssl
 
   esp-idf:
     name: Build with ESP-IDF ${{ matrix.idf_ver }} for ${{ matrix.idf_target }}

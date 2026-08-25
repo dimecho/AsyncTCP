@@ -206,8 +206,7 @@ int AsyncTCPTLS::startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip) {
         NULL, 0,
         NULL, 0,
         NULL, 0,
-        NULL, NULL,
-        true);
+        NULL, NULL);
 }
 
 int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
@@ -216,30 +215,32 @@ int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         NULL, 0,
         NULL, 0,
         NULL, 0,
-        pskIdent, psKey,
-        false);
+        pskIdent, psKey);
 }
 
 int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const char *rootCABuff,
         const char *cli_cert,
-        const char *cli_key) {
+        const char *cli_key,
+        const char *keyPassword) {
     return startSSLClient(pcb, host_or_ip,
         (const unsigned char *)rootCABuff, (rootCABuff != NULL) ? strlen(rootCABuff) + 1 : 0,
         (const unsigned char *)cli_cert, (cli_cert != NULL) ? strlen(cli_cert) + 1 : 0,
-        (const unsigned char *)cli_key, (cli_key != NULL) ? strlen(cli_key) + 1 : 0);
+        (const unsigned char *)cli_key, (cli_key != NULL) ? strlen(cli_key) + 1 : 0,
+        keyPassword);
 }
 
 int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const unsigned char *rootCABuff, const size_t rootCABuff_len,
         const unsigned char *cli_cert, const size_t cli_cert_len,
-        const unsigned char *cli_key, const size_t cli_key_len) {
+        const unsigned char *cli_key, const size_t cli_key_len,
+        const char *keyPassword) {
     return _startSSLClient(pcb, host_or_ip,
         rootCABuff, rootCABuff_len,
         cli_cert, cli_cert_len,
         cli_key, cli_key_len,
         NULL, NULL,
-        false);
+        keyPassword);
 }
 
 int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
@@ -247,12 +248,8 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const unsigned char *cli_cert, const size_t cli_cert_len,
         const unsigned char *cli_key, const size_t cli_key_len,
         const char *pskIdent, const char *psKey,
-        bool insecure) {
+        const char *keyPassword) {
     int ret;
-
-    if (rootCABuff == NULL && pskIdent == NULL && psKey == NULL && !insecure) {
-        return -1;
-    }
 
     if (!pcb) {
         return -1;
@@ -267,10 +264,10 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         return handle_error(ret);
     }
 
-    if (insecure) {
+    if (rootCABuff == NULL) {
         mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
         async_tcp_log_i("WARNING: Skipping SSL Verification. INSECURE!");
-    } else if (rootCABuff != NULL) {
+    } else {
         async_tcp_log_v("Loading CA cert");
         mbedtls_x509_crt_init(&ca_cert);
         mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
@@ -332,7 +329,11 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         }
 
         async_tcp_log_v("Loading private key");
-        ret = mbedtls_pk_parse_key(&client_key, cli_key, cli_key_len, NULL, 0, mbedtls_ctr_drbg_random, &drbg_ctx);
+        if (_ssl_key_password) { free(_ssl_key_password); _ssl_key_password = NULL; }
+        _ssl_key_password = keyPassword ? strdup(keyPassword) : NULL;
+        const unsigned char *pwd = (const unsigned char *)_ssl_key_password;
+        size_t pwd_len = _ssl_key_password ? strlen(_ssl_key_password) : 0;
+        ret = mbedtls_pk_parse_key(&client_key, cli_key, cli_key_len, pwd, pwd_len, mbedtls_ctr_drbg_random, &drbg_ctx);
         _have_client_key = true;
         if (ret != 0) {
             _deleteHandshakeCerts();

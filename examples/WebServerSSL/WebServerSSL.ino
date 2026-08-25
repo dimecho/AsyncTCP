@@ -3,13 +3,30 @@
  *
  * ESP32 HTTPS server using AsyncTCP + AsyncTCPTLS directly.
  * Serves a simple page and a JSON API over TLS 1.2 on port 443.
- * Includes a ready-to-use self-signed cert (key password: test123).
+ * Uses a CA-signed cert — the same CA that signs the ClientSSL example's
+ * client cert, so either example can verify the other.
  *
- * Regenerate your own (RSA-2048):
- *   openssl req -x509 -newkey rsa:2048 \
- *     -passout pass:test123 -keyout server.key -out server.pem -days 3650 \
- *     -subj "/CN=esp32.local" \
- *     -addext "subjectAltName=DNS:esp32.local,IP:192.168.4.1"
+ * Includes a ready-to-use test PKI (key password: test123):
+ *   - CA cert       — shared trust root (matches ClientSSL example)
+ *   - Server cert   — signed by the CA, CN=esp32-server.local
+ *
+ * Regenerate the full PKI:
+ *   # CA
+ *   openssl req -x509 -newkey rsa:2048 -passout pass:test123 \
+ *     -keyout ca.key -out ca.pem -days 3650 -subj "/CN=ESP32 Test CA"
+ *
+ *   # Server (signed by CA)
+ *   openssl req -newkey rsa:2048 -passout pass:test123 \
+ *     -keyout server.key -out server.csr -subj "/CN=esp32-server.local"
+ *   openssl x509 -req -in server.csr -CA ca.pem -passin pass:test123 \
+ *     -CAkey ca.key -CAcreateserial -out server.pem -days 3650 \
+ *     -extfile <(printf "subjectAltName=DNS:esp32-server.local,IP:192.168.4.1")
+ *
+ *   # Client (signed by CA)
+ *   openssl req -newkey rsa:2048 -passout pass:test123 \
+ *     -keyout client.key -out client.csr -subj "/CN=esp32-client"
+ *   openssl x509 -req -in client.csr -CA ca.pem -passin pass:test123 \
+ *     -CAkey ca.key -CAcreateserial -out client.pem -days 3650
  *
  * Test with:
  *   curl -k https://<ESP32_IP>/api
@@ -24,62 +41,60 @@
 const char *SSID     = "YOUR_SSID";
 const char *PASSWORD = "YOUR_PASSWORD";
 
-// Self-signed RSA-2048 cert for esp32.local — key password: test123
-// Regenerate: openssl req -x509 -newkey rsa:2048 \
-//   -passout pass:test123 -keyout server.key -out server.pem -days 3650 \
-//   -subj "/CN=esp32.local" -addext "subjectAltName=DNS:esp32.local,IP:192.168.4.1"
+// CA-signed server cert — key password: test123
+// Signed by "ESP32 Test CA" (same CA as ClientSSL example)
 static const char SERVER_CERT[] PROGMEM = R"EOF(
 -----BEGIN CERTIFICATE-----
-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
+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
 -----END CERTIFICATE-----
 )EOF";
 
 static const char SERVER_KEY[] PROGMEM = R"EOF(
 -----BEGIN ENCRYPTED PRIVATE KEY-----
-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
+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
 -----END ENCRYPTED PRIVATE KEY-----
 )EOF";
 

@@ -70,7 +70,7 @@ private:
         const unsigned char *cli_cert, const size_t cli_cert_len,
         const unsigned char *cli_key, const size_t cli_key_len,
         const char *pskIdent, const char *psKey,
-        bool insecure);
+        const char *keyPassword = NULL);
 
     void _deleteHandshakeCerts(void);
 
@@ -103,12 +103,14 @@ public:
     int startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const char *rootCABuff,
         const char *cli_cert,
-        const char *cli_key);
+        const char *cli_key,
+        const char *keyPassword = NULL);
 
     int startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const unsigned char *rootCABuff, const size_t rootCABuff_len,
         const unsigned char *cli_cert, const size_t cli_cert_len,
-        const unsigned char *cli_key, const size_t cli_key_len);
+        const unsigned char *cli_key, const size_t cli_key_len,
+        const char *keyPassword = NULL);
 
     int startSSLServer(tcp_pcb *pcb,
         const unsigned char *server_cert, size_t server_cert_len,
