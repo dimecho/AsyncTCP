@@ -38,8 +38,8 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 
-const char *SSID     = "YOUR_SSID";
-const char *PASSWORD = "YOUR_PASSWORD";
+const char *AP_SSID     = "ESP32-AP";
+const char *AP_PASSWORD = "12345678";  // min 8 chars
 
 // CA-signed server cert — key password: test123
 // Signed by "ESP32 Test CA" (same CA as ClientSSL example)
@@ -167,13 +167,9 @@ void setup() {
   Serial.begin(115200);
   delay(500);
 
-  WiFi.begin(SSID, PASSWORD);
-  Serial.print("Connecting to WiFi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  delay(500);
+  Serial.printf("\nAP SSID: %s  IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
   sslServer = new AsyncServer(443);
   sslServer->onClient(onClient, NULL);
@@ -181,7 +177,7 @@ void setup() {
 
   Serial.printf("[Server] HTTPS on port 443\n");
   Serial.printf("Test: curl -k https://%s/api\n",
-                WiFi.localIP().toString().c_str());
+                WiFi.softAPIP().toString().c_str());
 }
 
 void loop() {

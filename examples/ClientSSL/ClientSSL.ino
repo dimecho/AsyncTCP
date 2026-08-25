@@ -39,12 +39,12 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 
-const char *SSID     = "YOUR_SSID";
-const char *PASSWORD = "YOUR_PASSWORD";
+const char *SSID     = "ESP32-AP";
+const char *PASSWORD = "12345678";
 
 // -- Server to connect to -------------------------------------------
 const char *SERVER_HOST = "192.168.4.1";
-const uint16_t SERVER_PORT = 4433;
+const uint16_t SERVER_PORT = 443;
 
 // -- CA certificate (verifies the server) --------------------------
 // Shared trust root — signed both the server and client certs.
