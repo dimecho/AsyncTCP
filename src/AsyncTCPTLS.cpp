@@ -161,11 +161,6 @@ AsyncTCPTLS::AsyncTCPTLS(void) {
     _ssl_rx_buf_capacity = _ssl_rx_buf ? ASYNCTCP_TLS_RX_BUF_SIZE : 0;
     _ssl_rx_buf_len = 0;
     _ssl_rx_pos = 0;
-    _ssl_rx_total = 0;
-
-    _ssl_tx_buf = (unsigned char *)malloc(ASYNCTCP_TLS_TX_BUF_SIZE);
-    _ssl_tx_buf_len = 0;
-    _ssl_tx_pos = 0;
 }
 
 AsyncTCPTLS::~AsyncTCPTLS() {
@@ -184,10 +179,6 @@ AsyncTCPTLS::~AsyncTCPTLS() {
     if (_ssl_rx_buf) {
         free(_ssl_rx_buf);
         _ssl_rx_buf = NULL;
-    }
-    if (_ssl_tx_buf) {
-        free(_ssl_tx_buf);
-        _ssl_tx_buf = NULL;
     }
 }
 
@@ -219,38 +210,7 @@ bool AsyncTCPTLS::feedRxData(const unsigned char *data, size_t len) {
     }
     memcpy(_ssl_rx_buf + _ssl_rx_buf_len, data, len);
     _ssl_rx_buf_len += len;
-    _ssl_rx_total += len;
     return true;
-}
-
-size_t AsyncTCPTLS::flushTxData(void) {
-    if (!_ssl_tx_buf || _ssl_tx_buf_len == 0 || !_pcb) return 0;
-    size_t sent = 0;
-    size_t remaining = _ssl_tx_buf_len - _ssl_tx_pos;
-    if (remaining > 0) {
-        err_t err = _tcp_ssl_write(_pcb, _ssl_tx_buf + _ssl_tx_pos, remaining, TCP_WRITE_FLAG_COPY);
-        if (err == ERR_OK) {
-            sent = remaining;
-            _ssl_tx_buf_len = 0;
-            _ssl_tx_pos = 0;
-        } else if (err == ERR_MEM) {
-            // TCP buffer full, try to send what we can
-            size_t space = tcp_sndbuf(_pcb);
-            if (space > 0) {
-                if (space > remaining) space = remaining;
-                err_t err2 = _tcp_ssl_write(_pcb, _ssl_tx_buf + _ssl_tx_pos, space, TCP_WRITE_FLAG_COPY);
-                if (err2 == ERR_OK) {
-                    sent = space;
-                    _ssl_tx_pos += space;
-                }
-            }
-        }
-    }
-    if (sent == 0 && _ssl_tx_buf_len > 0 && _ssl_tx_pos >= _ssl_tx_buf_len) {
-        _ssl_tx_buf_len = 0;
-        _ssl_tx_pos = 0;
-    }
-    return sent;
 }
 
 int AsyncTCPTLS::startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip) {
@@ -402,8 +362,10 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
 
     mbedtls_ssl_conf_rng(&ssl_conf, mbedtls_ctr_drbg_random, &drbg_ctx);
 
-    // Reduce buffer sizes to fit ESP32 heap
+    // Reduce buffer sizes to fit ESP32 heap (requires MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
+#if defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
     mbedtls_ssl_conf_max_frag_len(&ssl_conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096);
+#endif
 
     if ((ret = mbedtls_ssl_setup(&ssl_ctx, &ssl_conf)) != 0) {
         _deleteHandshakeCerts();
@@ -446,8 +408,10 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
     mbedtls_ssl_conf_min_tls_version(&ssl_conf, MBEDTLS_SSL_VERSION_TLS1_2);
     mbedtls_ssl_conf_max_tls_version(&ssl_conf, MBEDTLS_SSL_VERSION_TLS1_2);
 
-    // Disable renegotiation
+    // Disable renegotiation (only available if MBEDTLS_SSL_RENEGOTIATION is enabled)
+#if defined(MBEDTLS_SSL_RENEGOTIATION)
     mbedtls_ssl_conf_renegotiation(&ssl_conf, MBEDTLS_SSL_RENEGOTIATION_DISABLED);
+#endif
 
     // Pin fast cipher suite — hardware-accelerated AES-GCM + SHA256 on ESP32
     static const int server_ciphersuites[] = {
@@ -540,7 +504,9 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
 
     mbedtls_ssl_conf_rng(&ssl_conf, mbedtls_ctr_drbg_random, &drbg_ctx);
 
+#if defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
     mbedtls_ssl_conf_max_frag_len(&ssl_conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096);
+#endif
 
     if ((ret = mbedtls_ssl_setup(&ssl_ctx, &ssl_conf)) != 0) {
         _deleteHandshakeCerts();
@@ -627,7 +593,6 @@ int AsyncTCPTLS::read(uint8_t *data, size_t len) {
     if (_ssl_rx_pos >= _ssl_rx_buf_len) {
         _ssl_rx_buf_len = 0;
         _ssl_rx_pos = 0;
-        _ssl_rx_total = 0;
     }
     return (int)copy;
 }
@@ -648,6 +613,7 @@ int AsyncTCPTLS::sslRead(uint8_t *data, size_t len) {
     }
     if (ret < 0) {
         async_tcp_log_e("mbedtls_ssl_read failed: -0x%04x", -ret);
+        logBioState("sslRead");
         return -1;
     }
     return ret;
@@ -655,6 +621,13 @@ int AsyncTCPTLS::sslRead(uint8_t *data, size_t len) {
 
 void AsyncTCPTLS::flushOutput(void) {
     // No-op: tcp_output is now inlined in _tcp_ssl_write
+}
+
+void AsyncTCPTLS::logBioState(const char *tag) const {
+    async_tcp_log_e("%s: rx_buf=%u/%u pos=%u rxBufLen=%u bytes_avail=%d",
+        tag, (unsigned)_ssl_rx_buf_len, (unsigned)_ssl_rx_buf_capacity,
+        (unsigned)_ssl_rx_pos, (unsigned)(_ssl_rx_buf_len - _ssl_rx_pos),
+        (int)mbedtls_ssl_get_bytes_avail((mbedtls_ssl_context *)&ssl_ctx));
 }
 
 void AsyncTCPTLS::sendCloseNotify(void) {

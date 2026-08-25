@@ -19,7 +19,6 @@ struct tcp_pcb;
 
 #define ASYNCTCP_TLS_RX_BUF_SIZE    4096
 #define ASYNCTCP_TLS_RX_BUF_MAX     16384
-#define ASYNCTCP_TLS_TX_BUF_SIZE    4096
 
 class AsyncTCPTLS
 {
@@ -54,11 +53,6 @@ private:
     size_t _ssl_rx_buf_capacity;  // current allocation size (grows via realloc)
     size_t _ssl_rx_buf_len;
     size_t _ssl_rx_pos;
-    size_t _ssl_rx_total;  // total bytes buffered, for tcp_recved()
-
-    unsigned char *_ssl_tx_buf;
-    size_t _ssl_tx_buf_len;
-    size_t _ssl_tx_pos;
 
     int _startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const unsigned char *rootCABuff, const size_t rootCABuff_len,
@@ -79,14 +73,14 @@ public:
     bool feedRxData(const unsigned char *data, size_t len);
     size_t rxBufLen() const { return _ssl_rx_buf_len - _ssl_rx_pos; }
 
-    // Flush BIO tx buffer to TCP (returns bytes flushed, 0 if nothing to flush)
-    size_t flushTxData(void);
-
     // Check if BIO has buffered rx data available
     bool hasRxData(void) const { return _ssl_rx_buf && (_ssl_rx_pos < _ssl_rx_buf_len); }
 
     // Public accessor for PCB (needed by BIO callbacks)
     tcp_pcb *pcb() const { return _pcb; }
+
+    // Diagnostic: log BIO buffer state
+    void logBioState(const char *tag) const;
 
     int startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip);
 

@@ -1008,13 +1008,6 @@ void AsyncClient::feedSSLRxData(const unsigned char *data, size_t len) {
   }
 }
 
-size_t AsyncClient::flushSSLTxData() {
-  if (_ssl_ctx) {
-    return _ssl_ctx->flushTxData();
-  }
-  return 0;
-}
-
 bool AsyncClient::hasSSLRxData() const {
   if (_ssl_ctx) {
     return _ssl_ctx->hasRxData();
@@ -1206,6 +1199,7 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
     if (ret != 0) {
       if (ret < 0 && ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
         async_tcp_log_e("SSL handshake failed: %d", ret);
+        _ssl_ctx->logBioState("handshake_poll");
         _clearSSLParams();
         if (_error_cb) {
           _error_cb(_error_cb_arg, this, -60);
@@ -1311,6 +1305,7 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
       // Still in progress, wait for more data
     } else {
       async_tcp_log_e("SSL handshake failed in _recv: %d", ret);
+      _ssl_ctx->logBioState("handshake");
       _clearSSLParams();
       if (_error_cb) {
         _error_cb(_error_cb_arg, this, -60);

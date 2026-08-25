@@ -295,7 +295,6 @@ public:
   uint32_t getSSLReceiveTimeout() const { return _ssl_timeout; }
   AsyncTCPTLS *getSSLContext() { return _ssl_ctx; }
   void feedSSLRxData(const unsigned char *data, size_t len);
-  size_t flushSSLTxData();
   bool hasSSLRxData() const;
   int sslRead(uint8_t *data, size_t len);
   int sslWrite(const uint8_t *data, size_t len);
