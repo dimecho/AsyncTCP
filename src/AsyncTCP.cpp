@@ -959,6 +959,16 @@ bool AsyncClient::connect(const char *host, uint16_t port) {
 }
 
 #if ASYNC_TCP_SSL_ENABLED
+void AsyncClient::_clearSSLParams(void) {
+  _ssl_host = "";
+  _ssl_ca_cert = NULL;
+  _ssl_ca_cert_len = 0;
+  _ssl_client_cert = NULL;
+  _ssl_client_cert_len = 0;
+  _ssl_client_key = NULL;
+  _ssl_client_key_len = 0;
+}
+
 bool AsyncClient::beginSecure(const char *host, uint16_t port, const char *rootCA,
     const char *clientCert, const char *clientKey) {
   return beginSecure(host, port,
@@ -1122,6 +1132,7 @@ int8_t AsyncClient::_close() {
     _ssl_ctx = 0;
     _ssl_handshake_done = false;
   }
+  _clearSSLParams();
 #endif
   int8_t err = _tcp_close(&_pcb, this);
   // _pcb is now NULL
@@ -1166,6 +1177,7 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
       async_tcp_log_e("startSSLClient failed: %d", ret);
       delete _ssl_ctx;
       _ssl_ctx = 0;
+      _clearSSLParams();
       if (_error_cb) {
         _error_cb(_error_cb_arg, this, -60);
       }
@@ -1181,6 +1193,7 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
     if (ret != 0) {
       if (ret < 0 && ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
         async_tcp_log_e("SSL handshake failed: %d", ret);
+        _clearSSLParams();
         if (_error_cb) {
           _error_cb(_error_cb_arg, this, -60);
         }
@@ -1273,6 +1286,7 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
       // Still in progress, wait for more data
     } else {
       async_tcp_log_e("SSL handshake failed in _recv: %d", ret);
+      _clearSSLParams();
       if (_error_cb) {
         _error_cb(_error_cb_arg, this, -60);
       }

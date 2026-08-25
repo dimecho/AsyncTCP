@@ -354,6 +354,7 @@ protected:
   size_t _ssl_client_cert_len;
   const unsigned char *_ssl_client_key;
   size_t _ssl_client_key_len;
+  void _clearSSLParams(void);
 #endif
 };
 
