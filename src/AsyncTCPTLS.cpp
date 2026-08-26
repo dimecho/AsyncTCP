@@ -173,14 +173,16 @@ AsyncTCPTLS::~AsyncTCPTLS() {
 bool AsyncTCPTLS::feedRxData(const unsigned char *data, size_t len) {
     if (!_ssl_rx_buf || len == 0) return true;
 
-    // Compact: move unconsumed data to front to reclaim space
-    if (_ssl_rx_pos > 0) {
+    // Only compact when there's not enough room at the tail
+    size_t free_at_tail = _ssl_rx_buf_capacity - _ssl_rx_buf_len;
+    if (len > free_at_tail && _ssl_rx_pos > 0) {
         size_t remaining = _ssl_rx_buf_len - _ssl_rx_pos;
         if (remaining > 0) {
             memmove(_ssl_rx_buf, _ssl_rx_buf + _ssl_rx_pos, remaining);
         }
         _ssl_rx_buf_len = remaining;
         _ssl_rx_pos = 0;
+        free_at_tail = _ssl_rx_buf_capacity - _ssl_rx_buf_len;
     }
 
     // Check hard cap — if exceeded, caller must hold the pbuf
@@ -189,7 +191,7 @@ bool AsyncTCPTLS::feedRxData(const unsigned char *data, size_t len) {
     }
 
     // Grow buffer if needed (up to cap)
-    if (_ssl_rx_buf_len + len > _ssl_rx_buf_capacity) {
+    if (len > free_at_tail) {
         size_t need = _ssl_rx_buf_len + len;
         unsigned char *newbuf = (unsigned char *)realloc(_ssl_rx_buf, need);
         if (!newbuf) return false;
@@ -264,10 +266,23 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         return handle_error(ret);
     }
 
-    if (rootCABuff == NULL) {
-        mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
-        async_tcp_log_i("WARNING: Skipping SSL Verification. INSECURE!");
-    } else if (rootCABuff != NULL) {
+    // Force TLS 1.2 only
+    mbedtls_ssl_conf_min_tls_version(&ssl_conf, MBEDTLS_SSL_VERSION_TLS1_2);
+    mbedtls_ssl_conf_max_tls_version(&ssl_conf, MBEDTLS_SSL_VERSION_TLS1_2);
+
+    // Disable renegotiation
+#if defined(MBEDTLS_SSL_RENEGOTIATION)
+    mbedtls_ssl_conf_renegotiation(&ssl_conf, MBEDTLS_SSL_RENEGOTIATION_DISABLED);
+#endif
+
+    // Pin fast cipher suite — hardware-accelerated AES-GCM + SHA256 on ESP32
+    static const int client_ciphersuites[] = {
+        MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        0
+    };
+    mbedtls_ssl_conf_ciphersuites(&ssl_conf, client_ciphersuites);
+
+    if (rootCABuff != NULL) {
         async_tcp_log_v("Loading CA cert");
         mbedtls_x509_crt_init(&ca_cert);
         mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
@@ -313,7 +328,9 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         return -1;
 #endif
     } else {
-        return -1;
+        // No CA cert, no PSK — skip server verification
+        mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+        async_tcp_log_i("WARNING: Skipping SSL Verification. INSECURE!");
     }
 
     if (rootCABuff != NULL && cli_cert != NULL && cli_key != NULL) {
@@ -534,7 +551,6 @@ int AsyncTCPTLS::runSSLHandshake(void) {
 
     if (handshake_start_time == 0) handshake_start_time = millis();
     ret = mbedtls_ssl_handshake(&ssl_ctx);
-    flushOutput();
     if (ret != 0) {
         if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE) {
             return handle_error(ret);
@@ -544,15 +560,8 @@ int AsyncTCPTLS::runSSLHandshake(void) {
         return ret;
     }
 
-    // Handshake completed, validate remote side if required...
-    if (_have_client_cert && _have_client_key) {
-        async_tcp_log_d("Protocol is %s Ciphersuite is %s", mbedtls_ssl_get_version(&ssl_ctx), mbedtls_ssl_get_ciphersuite(&ssl_ctx));
-        if ((ret = mbedtls_ssl_get_record_expansion(&ssl_ctx)) >= 0) {
-            async_tcp_log_d("Record expansion is %d", ret);
-        } else {
-            async_tcp_log_w("Record expansion is unknown (compression)");
-        }
-    }
+    async_tcp_log_d("TLS handshake done: %s / %s",
+        mbedtls_ssl_get_version(&ssl_ctx), mbedtls_ssl_get_ciphersuite(&ssl_ctx));
 
     async_tcp_log_v("Verifying peer X.509 certificate...");
 
@@ -580,7 +589,6 @@ int AsyncTCPTLS::write(const uint8_t *data, size_t len) {
     if (!_pcb) return -1;
 
     int ret = mbedtls_ssl_write(&ssl_ctx, data, len);
-    flushOutput();
     if (ret != MBEDTLS_ERR_SSL_WANT_READ && ret != MBEDTLS_ERR_SSL_WANT_WRITE && ret < 0) {
         return handle_error(ret);
     }
@@ -604,7 +612,6 @@ int AsyncTCPTLS::read(uint8_t *data, size_t len) {
 int AsyncTCPTLS::sslRead(uint8_t *data, size_t len) {
     if (!_pcb) return -1;
     int ret = mbedtls_ssl_read(&ssl_ctx, data, len);
-    flushOutput();
     if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
         return 0;
     }
@@ -623,10 +630,6 @@ int AsyncTCPTLS::sslRead(uint8_t *data, size_t len) {
     return ret;
 }
 
-void AsyncTCPTLS::flushOutput(void) {
-    // No-op: tcp_output is now inlined in _tcp_ssl_write
-}
-
 void AsyncTCPTLS::logBioState(const char *tag) const {
     async_tcp_log_e("%s: rx_buf=%u/%u pos=%u rxBufLen=%u bytes_avail=%d",
         tag, (unsigned)_ssl_rx_buf_len, (unsigned)_ssl_rx_buf_capacity,
@@ -637,7 +640,6 @@ void AsyncTCPTLS::logBioState(const char *tag) const {
 void AsyncTCPTLS::sendCloseNotify(void) {
     if (!_pcb) return;
     int ret = mbedtls_ssl_close_notify(&ssl_ctx);
-    flushOutput();
     if (ret != 0) {
         async_tcp_log_d("close_notify: %d", ret);
     }

@@ -126,9 +126,6 @@ public:
     // Decrypt application data via mbedtls_ssl_read (BIO pulls encrypted bytes internally)
     int sslRead(uint8_t *data, size_t len);
 
-    // Flush deferred tcp_output (called after mbedtls_ssl_handshake/write/read completes)
-    void flushOutput(void);
-
     // Send TLS close_notify alert and flush to TCP
     void sendCloseNotify(void);
 };

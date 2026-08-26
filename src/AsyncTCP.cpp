@@ -416,10 +416,23 @@ static void _bind_tcp_callbacks(tcp_pcb *pcb, AsyncClient *client) {
   tcp_poll(pcb, &AsyncTCP_detail::tcp_poll, CONFIG_ASYNC_TCP_POLL_TIMER);
 }
 
+// Drain callback: ACKs and drops any late data arriving after close is initiated.
+// Without this, LwIP sends RST when data arrives on a PCB with tcp_recv=NULL.
+static err_t _tcp_drain_recv(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err) {
+  (void)arg; (void)err;
+  if (p) {
+    tcp_recved(pcb, p->tot_len);
+    pbuf_free(p);
+  } else {
+    // NULL pbuf = remote closed — safe to ignore, close already in progress
+  }
+  return ERR_OK;
+}
+
 static void _reset_tcp_callbacks(tcp_pcb *pcb, AsyncClient *client) {
   tcp_arg(pcb, NULL);
   tcp_sent(pcb, NULL);
-  tcp_recv(pcb, NULL);
+  tcp_recv(pcb, _tcp_drain_recv);  // drain late data instead of RST
   tcp_err(pcb, NULL);
   tcp_poll(pcb, NULL, 0);
   if (client) {
@@ -656,6 +669,10 @@ static err_t _tcp_close_api(struct tcpip_api_call_data *api_call_msg) {
   if (*msg->pcb) {
     tcp_pcb *pcb = *msg->pcb;
     _reset_tcp_callbacks(pcb, msg->close);
+    // Flush pending output before close — gives tcp_close the best chance
+    // of succeeding. Without this, queued data forces tcp_close to fail,
+    // and the tcp_shutdown fallback sends FIN with unACKed data → RST.
+    tcp_output(pcb);
     if (tcp_close(pcb) != ERR_OK) {
       // tcp_close fails when unsent data remains (e.g. HTTP response not yet ACKed).
       // Send FIN gracefully instead of RST to avoid NS_ERROR_NET_RESET.
@@ -1294,7 +1311,11 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
       if (!_ssl_ctx->feedRxData((const unsigned char *)pb->payload, pb->len)) {
         // BIO buffer full — hold remaining pbufs without acking
         // LwIP backpressures naturally via TCP window
-        _ssl_pending_pbufs = pb;
+        if (_ssl_pending_pbufs) {
+          pbuf_chain(_ssl_pending_pbufs, pb);
+        } else {
+          _ssl_pending_pbufs = pb;
+        }
         break;
       }
       pbuf *b = pb;
@@ -1337,7 +1358,11 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
       _rx_last_packet = millis();
       if (!_ssl_ctx->feedRxData((const unsigned char *)pb->payload, pb->len)) {
         // BIO buffer full — hold remaining pbufs without acking
-        _ssl_pending_pbufs = pb;
+        if (_ssl_pending_pbufs) {
+          pbuf_chain(_ssl_pending_pbufs, pb);
+        } else {
+          _ssl_pending_pbufs = pb;
+        }
         break;
       }
       pbuf *b = pb;
@@ -1357,7 +1382,6 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
         async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, buf, n));
       }
     }
-    _ssl_ctx->flushOutput();
     return ERR_OK;
   }
 #endif
@@ -1436,8 +1460,6 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
         async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, buf, n));
       }
     }
-    _ssl_ctx->flushOutput();
-
     // Try to feed held pbufs now that BIO buffer has drained
     pbuf *pb = _ssl_pending_pbufs;
     _ssl_pending_pbufs = NULL;
@@ -1964,6 +1986,7 @@ int8_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, int8_t err) {
       // Couldn't allocate accept event
       // We can't let the client object call in to close, as we're on the LWIP thread; it could deadlock trying to RPC to itself
       c->_pcb = nullptr;
+      delete c;
       tcp_abort(pcb);
       async_tcp_log_e("_accept failed: couldn't accept client");
       return ERR_ABRT;
