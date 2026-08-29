@@ -6,8 +6,6 @@
 
 #include <Arduino.h>
 #include "AsyncTCPLogging.h"
-#include <mbedtls/sha256.h>
-#include <mbedtls/oid.h>
 #include <mbedtls/pem.h>
 
 extern "C" {

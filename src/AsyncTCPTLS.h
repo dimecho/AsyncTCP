@@ -22,8 +22,6 @@
 #endif
 #include "mbedtls/error.h"
 #include "mbedtls/pem.h"
-#include "mbedtls/sha256.h"
-#include "mbedtls/oid.h"
 
 struct tcp_pcb;
 
