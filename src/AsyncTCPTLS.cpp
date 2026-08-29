@@ -111,29 +111,71 @@ static int _lwip_ssl_recv(void *ctx, unsigned char *buf, size_t len) {
     return sslctx->read(buf, len);
 }
 
+#if ASYNCTCP_MBEDTLS_MAJOR >= 4
+// v4: RNG params removed — PSA Crypto provides the RNG internally.
+int AsyncTCPTLS::_parse_private_key(mbedtls_pk_context *pk,
+        const unsigned char *key, size_t keylen,
+        const unsigned char *pwd, size_t pwdlen) {
+    return mbedtls_pk_parse_key(pk, key, keylen, pwd, pwdlen);
+}
+#else
+int AsyncTCPTLS::_parse_private_key(mbedtls_pk_context *pk,
+        const unsigned char *key, size_t keylen,
+        const unsigned char *pwd, size_t pwdlen) {
+    return mbedtls_pk_parse_key(pk, key, keylen, pwd, pwdlen,
+                                mbedtls_ctr_drbg_random, &drbg_ctx);
+}
+#endif
+
 /*
  * AsyncTCPTLS implementation
  */
 
 // Static shared RNG — initialized once, serialized on async task
+#if ASYNCTCP_MBEDTLS_MAJOR < 4
 mbedtls_ctr_drbg_context AsyncTCPTLS::drbg_ctx;
 mbedtls_entropy_context AsyncTCPTLS::entropy_ctx;
+#endif
 bool AsyncTCPTLS::_conf_initialized = false;
 int AsyncTCPTLS::_active_count = 0;
 
-void AsyncTCPTLS::_init_rng(void) {
-    if (_conf_initialized) return;
+#if ASYNCTCP_MBEDTLS_MAJOR >= 4
+// Mbed TLS v4: PSA Crypto provides the RNG internally, so no app RNG is
+// needed. We only have to ensure PSA is initialised (see _rng_init).
+#include <psa/crypto.h>
+#endif
+
+int AsyncTCPTLS::_rng_init(void) {
+    if (_conf_initialized) return 0;
+#if ASYNCTCP_MBEDTLS_MAJOR >= 4
+    psa_status_t ps = psa_crypto_init();
+    if (ps != PSA_SUCCESS) {
+        async_tcp_log_e("psa_crypto_init failed: %d", (int)ps);
+        return -1;
+    }
+    _conf_initialized = true;
+#else
+    _rng_seed_and_set();
+    _conf_initialized = true;
+#endif
+    return 0;
+}
+
+#if ASYNCTCP_MBEDTLS_MAJOR < 4
+void AsyncTCPTLS::_rng_seed_and_set(void) {
     mbedtls_ctr_drbg_init(&drbg_ctx);
     mbedtls_entropy_init(&entropy_ctx);
     mbedtls_ctr_drbg_seed(&drbg_ctx, mbedtls_entropy_func,
                           &entropy_ctx, (const unsigned char *)"AsyncTCPTLS", 11);
-    _conf_initialized = true;
 }
+#endif
 
 AsyncTCPTLS::AsyncTCPTLS(void) {
     mbedtls_ssl_init(&ssl_ctx);
     mbedtls_ssl_config_init(&ssl_conf);
-    _init_rng();
+    if (_rng_init() != 0) {
+        async_tcp_log_e("AsyncTCPTLS RNG init failed");
+    }
     _pcb = NULL;
     _ssl_key_password = NULL;
     _have_ca_cert = false;
@@ -351,7 +393,7 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         _ssl_key_password = keyPassword ? strdup(keyPassword) : NULL;
         const unsigned char *pwd = (const unsigned char *)_ssl_key_password;
         size_t pwd_len = _ssl_key_password ? strlen(_ssl_key_password) : 0;
-        ret = mbedtls_pk_parse_key(&client_key, cli_key, cli_key_len, pwd, pwd_len, mbedtls_ctr_drbg_random, &drbg_ctx);
+        ret = _parse_private_key(&client_key, cli_key, cli_key_len, pwd, pwd_len);
         _have_client_key = true;
         if (ret != 0) {
             _deleteHandshakeCerts();
@@ -372,7 +414,9 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         return handle_error(ret);
     }
 
+#if ASYNCTCP_MBEDTLS_MAJOR < 4
     mbedtls_ssl_conf_rng(&ssl_conf, mbedtls_ctr_drbg_random, &drbg_ctx);
+#endif
 
     // Reduce buffer sizes to fit ESP32 heap (requires MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
 #if defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
@@ -507,16 +551,16 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
             (const unsigned char *)pem_buf, pwd, pwd_len, &use_len);
         if (ret == 0) {
             const unsigned char *der_buf = mbedtls_pem_get_buffer(&pem, &key_der_len);
-            ret = mbedtls_pk_parse_key(&client_key, der_buf, key_der_len,
-                pwd, pwd_len, mbedtls_ctr_drbg_random, &drbg_ctx);
+            ret = _parse_private_key(&client_key, der_buf, key_der_len,
+                pwd, pwd_len);
         }
         mbedtls_pem_free(&pem);
         free(pem_buf);
     } else {
         // DER — parse directly with length
         async_tcp_log_v("Parsing key DER (%u bytes)", (unsigned)server_key_len);
-        ret = mbedtls_pk_parse_key(&client_key, server_key, server_key_len,
-            NULL, 0, mbedtls_ctr_drbg_random, &drbg_ctx);
+        ret = _parse_private_key(&client_key, server_key, server_key_len,
+            NULL, 0);
     }
     _have_client_key = true;
     if (ret != 0) {
@@ -526,7 +570,9 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
 
     mbedtls_ssl_conf_own_cert(&ssl_conf, &client_cert, &client_key);
 
+#if ASYNCTCP_MBEDTLS_MAJOR < 4
     mbedtls_ssl_conf_rng(&ssl_conf, mbedtls_ctr_drbg_random, &drbg_ctx);
+#endif
 
 #if defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
     mbedtls_ssl_conf_max_frag_len(&ssl_conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096);

@@ -2,11 +2,24 @@
 
 #if ASYNC_TCP_SSL_ENABLED
 
+// --- mbedTLS version abstraction -----------------------------------------
+// Mbed TLS v3 (stable Arduino core 3.x): legacy entropy + CTR-DRBG RNG.
+// Mbed TLS v4 (dev core / ESP-IDF 6.0): PSA Crypto; entropy/ctr_drbg headers
+// and app-supplied RNG callbacks were removed.
+#include "mbedtls/build_info.h"   // defines MBEDTLS_VERSION_MAJOR on v3/v4
+#ifndef MBEDTLS_VERSION_MAJOR
+#define MBEDTLS_VERSION_MAJOR 3
+#endif
+#define ASYNCTCP_MBEDTLS_MAJOR MBEDTLS_VERSION_MAJOR
+// -------------------------------------------------------------------------
+
 #include "mbedtls/platform.h"
 #include "mbedtls/debug.h"
 #include "mbedtls/ssl.h"
+#if ASYNCTCP_MBEDTLS_MAJOR < 4
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
+#endif
 #include "mbedtls/error.h"
 #include "mbedtls/pem.h"
 #include "mbedtls/sha256.h"
@@ -34,15 +47,25 @@ private:
     mbedtls_ssl_context ssl_ctx;
     mbedtls_ssl_config ssl_conf;
 
-    // Shared across all instances — initialized once, RNG is serialized on async task
+    // Shared RNG — initialized once, serialized on async task.
+    // v3: legacy entropy + CTR-DRBG. v4: PSA Crypto (no DRBG types).
+#if ASYNCTCP_MBEDTLS_MAJOR < 4
     static mbedtls_ctr_drbg_context drbg_ctx;
     static mbedtls_entropy_context entropy_ctx;
+#endif
     static bool _conf_initialized;
+
+    static int _rng_init(void);
+#if ASYNCTCP_MBEDTLS_MAJOR < 4
+    static void _rng_seed_and_set(void);
+#endif
+    // Parse a PEM/DER private key. v3 supplies the legacy RNG; v4 uses PSA.
+    static int _parse_private_key(mbedtls_pk_context *pk,
+        const unsigned char *key, size_t keylen,
+        const unsigned char *pwd, size_t pwdlen);
 
     // Concurrent connection tracking
     static int _active_count;
-
-    static void _init_rng(void);
 
     mbedtls_x509_crt ca_cert;
     mbedtls_x509_crt client_cert;
