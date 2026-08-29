@@ -2,6 +2,8 @@
 // SSL/TLS support for AsyncTCP using mbedTLS over LwIP raw TCP (tcp_pcb)
 // Custom BIO callbacks replace BSD socket mbedtls_net_send/mbedtls_net_recv
 
+#if ASYNC_TCP_SSL_ENABLED
+
 #include <Arduino.h>
 #include "AsyncTCPLogging.h"
 #include <mbedtls/sha256.h>
@@ -14,7 +16,6 @@ extern "C" {
 
 #include "AsyncTCPTLS.h"
 
-#if ASYNC_TCP_SSL_ENABLED
 #if !defined(MBEDTLS_KEY_EXCHANGE__SOME__PSK_ENABLED) && !defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
 #  warning "PSK ciphersuites not configured — PSK TLS overloads will be unavailable"
 #endif

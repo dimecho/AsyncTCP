@@ -133,11 +133,9 @@ AsyncClient *sslClient = NULL;
 void onConnected(void *arg, AsyncClient *client) {
   Serial.println("[Client] TLS handshake complete — sending request");
 
-  const char *request =
-      "GET / HTTP/1.1\r\n"
-      "Host: " SERVER_HOST "\r\n"
-      "Connection: close\r\n"
-      "\r\n";
+  char request[128];
+  snprintf(request, sizeof(request),
+      "GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", SERVER_HOST);
   client->write(request, strlen(request));
 }
 
@@ -149,7 +147,6 @@ void onData(void *arg, AsyncClient *client, void *data, size_t len) {
 
 void onDisconnect(void *arg, AsyncClient *client) {
   Serial.println("[Client] Disconnected");
-  client->close(true);
 }
 
 void onError(void *arg, AsyncClient *client, int8_t error) {
