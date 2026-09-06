@@ -1,10 +1,19 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // Copyright 2016-2026 Hristo Gochkov, Mathieu Carbou, Emil Muratov, Will Miles
+//
+// Unified dual-stack AsyncTCP library.
+//   - ESP8266         -> BearSSL stack (AsyncTCP fork, NO_SYS lwIP)
+//   - ESP32/LIBRETINY -> mbedTLS stack (AsyncTCP ESP32Async base)
+// Selected at compile time via #if defined(ESP8266). Only one stack compiles per target.
+
+// SPDX-License-Identifier: LGPL-3.0-or-later
+// Copyright 2016-2026 Hristo Gochkov, Mathieu Carbou, Emil Muratov, Will Miles
 
 #ifndef ASYNCTCP_H_
 #define ASYNCTCP_H_
 
 #include "AsyncTCPVersion.h"
+#include "AsyncTCPTLS.h"  // SSL, BearSSL_SSL_CTX, tcp_ssl_* decls (per-platform half)
 #define ASYNCTCP_FORK_ESP32Async
 
 #ifdef ARDUINO
@@ -18,10 +27,8 @@
 #include "lwip/ip_addr.h"
 #include <functional>
 
-#if defined(ESP32)
-#include "sdkconfig.h"
+#if defined(ESP8266)
 extern "C" {
-#include "freertos/semphr.h"
 #include "lwip/pbuf.h"
 }
 #elif defined(LIBRETINY)
@@ -30,11 +37,14 @@ extern "C" {
 #include <FreeRTOS.h>
 #include <semphr.h>
 }
-#elif defined(ESP8266)
+#else /* ESP32 */
+#include "sdkconfig.h"
 extern "C" {
+#include "freertos/semphr.h"
 #include "lwip/pbuf.h"
 }
 #endif
+
 
 // If core is not defined, then we are running in Arduino or PIO
 #ifndef CONFIG_ASYNC_TCP_RUNNING_CORE
@@ -76,6 +86,354 @@ typedef std::function<void(void *, AsyncClient *, uint32_t time)> AcTimeoutHandl
 
 struct tcp_pcb;
 class AsyncTCP_detail;
+
+#if defined(ESP8266)   // ---------------- ESP8266 + BearSSL -------------
+#if ASYNC_TCP_SSL_ENABLED
+typedef std::function<int(void *arg, const char *filename, uint8_t **buf)> AcSSLFileHandler;
+typedef AcSSLFileHandler AcSSlFileHandler;  // backward compat (old typo)
+struct pending_pcb;
+#endif
+
+class AsyncClient {
+public:
+  AsyncClient(tcp_pcb *pcb = 0);
+#if ASYNC_TCP_SSL_ENABLED
+  AsyncClient(tcp_pcb *pcb, BearSSL_SSL_CTX *ssl_ctx);
+#endif
+  ~AsyncClient();
+
+  // Noncopyable
+  AsyncClient(const AsyncClient &) = delete;
+  AsyncClient &operator=(const AsyncClient &) = delete;
+
+  // Nonmovable
+  AsyncClient(AsyncClient &&) = delete;
+  AsyncClient &operator=(AsyncClient &&) = delete;
+
+  bool operator==(const AsyncClient &other) const;
+
+  bool operator!=(const AsyncClient &other) const {
+    return !(*this == other);
+  }
+  bool connect(ip_addr_t addr, uint16_t port);
+#ifdef ARDUINO
+  bool connect(const IPAddress &ip, uint16_t port);
+#if __has_include(<IPv6Address.h>)
+  bool connect(const IPv6Address &ip, uint16_t port);
+#endif
+#endif
+  bool connect(const char *host, uint16_t port);
+
+#if ASYNC_TCP_SSL_ENABLED
+  void setSSLContext(BearSSL_SSL_CTX *ctx) {
+    _client_ssl_ctx = ctx;
+  }
+  BearSSL_SSL_CTX *getSSLContext() const {
+    return _client_ssl_ctx;
+  }
+  bool startTLS(const char *host = "");
+  bool beginSecure(const char *host, uint16_t port, const char *rootCA = NULL);
+#endif
+
+  /**
+     * @brief close connection
+     *
+     * @param now - ignored
+     */
+  [[deprecated("Use AsyncClient::close() instead")]]
+  void close(bool now __attribute__((unused))) {
+    close();
+  }
+  [[deprecated("Use AsyncClient::close() instead")]]
+  void stop() {
+    close();
+  };
+
+  /**
+     * @brief close connection
+     */
+  void close();
+
+  int8_t abort();
+  bool free();
+
+  // ack is not pending
+  bool canSend() const;
+  // TCP buffer space available
+  size_t space() const;
+
+  /**
+     * @brief add data to be send (but do not send yet)
+     * @note add() would call lwip's tcp_write()
+        By default apiflags=ASYNC_WRITE_FLAG_COPY
+        You could try to use apiflags with this flag unset to pass data by reference and avoid copy to socket buffer,
+        but looks like it does not work for Arduino's lwip in ESP32/IDF at least
+        it is enforced in https://github.com/espressif/esp-lwip/blob/0606eed9d8b98a797514fdf6eabb4daf1c8c8cd9/src/core/tcp_out.c#L422C5-L422C30
+        if LWIP_NETIF_TX_SINGLE_PBUF is set, and it is set indeed in IDF
+        https://github.com/espressif/esp-idf/blob/a0f798cfc4bbd624aab52b2c194d219e242d80c1/components/lwip/port/include/lwipopts.h#L744
+     *
+     * @param data
+     * @param size
+     * @param apiflags
+     * @return size_t amount of data that has been copied
+     */
+  size_t add(const char *data, size_t size, uint8_t apiflags = ASYNC_WRITE_FLAG_COPY);
+
+  /**
+     * @brief send data previously add()'ed
+     *
+     * @return true on success
+     * @return false on error
+     */
+  bool send();
+
+  /**
+     * @brief add and enqueue data for sending
+     * @note it is same as add() + send()
+     * @note only make sense when canSend() == true
+     *
+     * @param data
+     * @param size
+     * @param apiflags
+     * @return size_t
+     */
+  size_t write(const char *data, size_t size, uint8_t apiflags = ASYNC_WRITE_FLAG_COPY);
+
+  /**
+     * @brief add and enqueue data for sending
+     * @note treats data as null-terminated string
+     *
+     * @param data
+     * @return size_t
+     */
+  size_t write(const char *data) {
+    return data == NULL ? 0 : write(data, strlen(data));
+  };
+
+  uint8_t state() const;
+  bool connecting() const;
+  bool connected() const;
+  bool disconnecting() const;
+  bool disconnected() const;
+
+  // disconnected or disconnecting
+  bool freeable() const;
+
+  uint16_t getMss() const;
+
+  uint32_t getRxTimeout() const;
+  // no RX data timeout for the connection in seconds
+  void setRxTimeout(uint32_t timeout);
+
+  uint32_t getAckTimeout() const;
+  // no ACK timeout for the last sent packet in milliseconds
+  void setAckTimeout(uint32_t timeout);
+
+  void setNoDelay(bool nodelay) const;
+  bool getNoDelay();
+
+  void setKeepAlive(uint32_t ms, uint8_t cnt);
+
+  uint32_t getRemoteAddress() const;
+  uint16_t getRemotePort() const;
+  uint16_t remotePort() const {
+    return getRemotePort();
+  }
+
+  uint32_t getLocalAddress() const;
+  uint16_t getLocalPort() const;
+  uint16_t localPort() const {
+    return getLocalPort();
+  }
+
+  ip4_addr_t getRemoteAddress4() const;
+  ip4_addr_t getLocalAddress4() const;
+
+#if LWIP_IPV6
+  ip6_addr_t getRemoteAddress6() const;
+  ip6_addr_t getLocalAddress6() const;
+#ifdef ARDUINO
+#if __has_include(<IPv6Address.h>)
+  IPv6Address remoteIP6() const;
+  IPv6Address localIP6() const;
+#else
+  IPAddress remoteIP6() const;
+  IPAddress localIP6() const;
+#endif
+#endif
+#endif
+
+#ifdef ARDUINO
+  IPAddress remoteIP() const;
+  IPAddress localIP() const;
+#endif
+
+  // set callback - on successful connect
+  void onConnect(AcConnectHandler cb, void *arg = 0);
+  // set callback - disconnected
+  void onDisconnect(AcConnectHandler cb, void *arg = 0);
+  // set callback - ack received
+  void onAck(AcAckHandler cb, void *arg = 0);
+  // set callback - unsuccessful connect or error
+  void onError(AcErrorHandler cb, void *arg = 0);
+  // set callback - data received (called if onPacket is not used)
+  void onData(AcDataHandler cb, void *arg = 0);
+  // set callback - data received
+  // !!! You MUST call ackPacket() or free the pbuf yourself to prevent memory leaks
+  void onPacket(AcPacketHandler cb, void *arg = 0);
+  // set callback - ack timeout
+  void onTimeout(AcTimeoutHandler cb, void *arg = 0);
+  // set callback - every 125ms when connected
+  void onPoll(AcConnectHandler cb, void *arg = 0);
+
+  // ack pbuf from onPacket
+  void ackPacket(struct pbuf *pb);
+  // ack data that you have not acked using the method below
+  size_t ack(size_t len);
+  // will not ack the current packet. Call from onData
+  void ackLater() {
+    _ack_pcb = false;
+  }
+
+  static const char *errorToString(int8_t error);
+  const char *stateToString() const;
+
+  int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
+  tcp_pcb *pcb() {
+    return _pcb;
+  }
+
+protected:
+  friend class AsyncTCP_detail;
+  friend class AsyncServer;
+
+  tcp_pcb *_pcb;
+
+  AcConnectHandler _connect_cb;
+  void *_connect_cb_arg;
+  AcConnectHandler _discard_cb;
+  void *_discard_cb_arg;
+  AcConnectHandler _server_discard_cb;  // set by AsyncServer for instant slot promote
+  void *_server_discard_cb_arg;
+  AcAckHandler _sent_cb;
+  void *_sent_cb_arg;
+  AcErrorHandler _error_cb;
+  void *_error_cb_arg;
+  AcDataHandler _recv_cb;
+  void *_recv_cb_arg;
+  AcPacketHandler _pb_cb;
+  void *_pb_cb_arg;
+  AcTimeoutHandler _timeout_cb;
+  void *_timeout_cb_arg;
+  AcConnectHandler _poll_cb;
+  void *_poll_cb_arg;
+
+  bool _ack_pcb;
+  bool _closing;
+#if ASYNC_TCP_SSL_ENABLED
+  bool _pcb_secure;
+  bool _handshake_done;
+  BearSSL_SSL_CTX *_client_ssl_ctx;
+#endif
+  uint32_t _tx_last_packet;
+  uint32_t _tx_unacked_len;
+  uint32_t _rx_ack_len;
+  uint32_t _rx_last_packet;
+  uint32_t _rx_timeout;
+  uint32_t _rx_last_ack;
+  uint32_t _ack_timeout;
+  uint16_t _connect_port;
+
+  int8_t _close();
+  int8_t _connected(tcp_pcb *pcb, int8_t err);
+  // TLS-aware connect. Public connect() is always plain TCP; beginSecure() is
+  // the TLS entry point. The secure flag selects the transport and is mirrored
+  // by _pcb_secure/_handshake_done.
+  bool connect(ip_addr_t addr, uint16_t port, bool secure);
+#ifdef ARDUINO
+  bool connect(const IPAddress &ip, uint16_t port, bool secure);
+#if __has_include(<IPv6Address.h>)
+  bool connect(const IPv6Address &ip, uint16_t port, bool secure);
+#endif
+#endif
+  bool connect(const char *host, uint16_t port, bool secure);
+  void _error(int8_t err);
+#if ASYNC_TCP_SSL_ENABLED
+  void _ssl_error(int8_t err);
+#endif
+  int8_t _poll(tcp_pcb *pcb);
+  int8_t _sent(tcp_pcb *pcb, uint16_t len);
+  int8_t _fin(tcp_pcb *pcb, int8_t err);
+  int8_t _lwip_fin(tcp_pcb *pcb, int8_t err);
+  void _dns_found(ip_addr_t *ipaddr);
+
+#if ASYNC_TCP_SSL_ENABLED
+  static void _s_data(void *arg, struct tcp_pcb *tcp, uint8_t *data, size_t len);
+  static void _s_handshake(void *arg, struct tcp_pcb *tcp, SSL *ssl);
+  static void _s_ssl_error(void *arg, struct tcp_pcb *tcp, int8_t err);
+#endif
+};
+
+class AsyncServer {
+public:
+  AsyncServer(ip_addr_t addr, uint16_t port);
+#ifdef ARDUINO
+  AsyncServer(IPAddress addr, uint16_t port);
+#if __has_include(<IPv6Address.h>)
+  AsyncServer(IPv6Address addr, uint16_t port);
+#endif
+#endif
+  AsyncServer(uint16_t port);
+  ~AsyncServer();
+  void onClient(AcConnectHandler cb, void *arg);
+#if ASYNC_TCP_SSL_ENABLED
+  void onSslFileRequest(AcSSLFileHandler cb, void *arg);
+  void beginSecure(const char *cert, const char *private_key_file, const char *password);
+#endif
+  void begin();
+  void end();
+  void setNoDelay(bool nodelay);
+  bool getNoDelay() const;
+  uint8_t status() const;
+
+protected:
+  friend class AsyncTCP_detail;
+
+  uint16_t _port;
+  ip_addr_t _addr;
+  bool _noDelay;
+  tcp_pcb *_pcb;
+  AcConnectHandler _connect_cb;
+  void *_connect_cb_arg;
+#if ASYNC_TCP_SSL_ENABLED
+  struct pending_pcb *_pending;
+  BearSSL_SSL_CTX *_ssl_ctx;
+  AcSSLFileHandler _file_cb;
+  void *_file_cb_arg;
+#endif
+
+  int8_t _accept(tcp_pcb *newpcb, int8_t err);
+  int8_t _accepted(AsyncClient *client);
+
+#if ASYNC_TCP_SSL_ENABLED
+  AsyncClient *_serveTls(tcp_pcb *pcb);
+  int _cert(const char *filename, uint8_t **buf);
+  int8_t _poll(tcp_pcb *pcb);
+  int8_t _recv(tcp_pcb *pcb, struct pbuf *pb, int8_t err);
+  void _error(int8_t err);
+  int8_t _promoteSlot(void);
+  void _conn_done(AsyncClient *client);
+  static int _s_cert(void *arg, const char *filename, uint8_t **buf);
+  static err_t _s_poll(void *arg, struct tcp_pcb *tpcb);
+  static err_t _s_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *pb, err_t err);
+  static void _s_error(void *arg, err_t err);
+  static void _s_conn_done(void *arg, AsyncClient *client);
+#endif
+};
+#else                 // ---------------- ESP32/LIBRETINY + mbedTLS ------
+#if ASYNC_TCP_SSL_ENABLED
+typedef std::function<int(void *arg, uint8_t **cert, uint8_t **key)> AcSSlFileHandler;
+#endif
 
 class AsyncClient {
 public:
@@ -272,6 +630,27 @@ public:
     return _pcb;
   }
 
+#if ASYNC_TCP_SSL_ENABLED
+  // SSL support (mbedTLS stack)
+  bool beginSecure(const char *host, uint16_t port, const char *rootCA,
+      const char *clientCert = NULL, const char *clientKey = NULL,
+      const char *keyPassword = NULL);
+  bool beginSecure(const char *host, uint16_t port,
+      const unsigned char *rootCA, size_t rootCALen,
+      const unsigned char *clientCert = NULL, size_t clientCertLen = 0,
+      const unsigned char *clientKey = NULL, size_t clientKeyLen = 0,
+      const char *keyPassword = NULL);
+  bool ssl() const { return _ssl_ctx != 0; }
+  void setSSLReceiveTimeout(uint32_t timeout) { _ssl_timeout = timeout; }
+  uint32_t getSSLReceiveTimeout() const { return _ssl_timeout; }
+  AsyncTCPTLS *getSSLContext() { return _ssl_ctx; }
+  void feedSSLRxData(const unsigned char *data, size_t len);
+  bool hasSSLRxData() const;
+  int sslRead(uint8_t *data, size_t len);
+  int sslWrite(const uint8_t *data, size_t len);
+  int runSSLHandshake();
+#endif
+
 protected:
   friend class AsyncTCP_detail;
   friend class AsyncServer;
@@ -312,6 +691,21 @@ protected:
   int8_t _fin(tcp_pcb *pcb, int8_t err);
   int8_t _lwip_fin(tcp_pcb *pcb, int8_t err);
   void _dns_found(ip_addr_t *ipaddr);
+#if ASYNC_TCP_SSL_ENABLED
+  AsyncTCPTLS *_ssl_ctx;
+  uint32_t _ssl_timeout;
+  bool _ssl_handshake_done;
+  String _ssl_host;
+  const unsigned char *_ssl_ca_cert;
+  size_t _ssl_ca_cert_len;
+  const unsigned char *_ssl_client_cert;
+  size_t _ssl_client_cert_len;
+  const unsigned char *_ssl_client_key;
+  size_t _ssl_client_key_len;
+  char *_ssl_key_password;
+  void _clearSSLParams(void);
+  pbuf *_ssl_pending_pbufs;
+#endif
 };
 
 class AsyncServer {
@@ -332,6 +726,19 @@ public:
   bool getNoDelay() const;
   uint8_t status() const;
 
+#if ASYNC_TCP_SSL_ENABLED
+  // SSL server support (mbedTLS stack)
+  bool beginSecure(const unsigned char *cert, size_t certLen,
+      const unsigned char *key, size_t keyLen);
+  bool beginSecure(const char *certPEM, const char *keyPEM);
+  bool beginSecure(const char *certPEM, const char *keyPEM, const char *password);
+  void setDefaultCertificate(const unsigned char *cert, size_t certLen);
+  void setDefaultKey(const unsigned char *key, size_t keyLen);
+  void setDefaultCertificatePEM(const char *certPEM);
+  void setDefaultKeyPEM(const char *keyPEM);
+  void onSslFileRequest(AcSSlFileHandler cb, void *arg);
+#endif
+
 protected:
   friend class AsyncTCP_detail;
 
@@ -342,8 +749,20 @@ protected:
   AcConnectHandler _connect_cb;
   void *_connect_cb_arg;
 
+#if ASYNC_TCP_SSL_ENABLED
+  bool _use_ssl;
+  const unsigned char *_cert;
+  size_t _cert_len;
+  const unsigned char *_key;
+  size_t _key_len;
+  AcSSlFileHandler _ssl_file_cb;
+  void *_ssl_file_cb_arg;
+  const char *_ssl_key_password;
+#endif
+
   int8_t _accept(tcp_pcb *newpcb, int8_t err);
   int8_t _accepted(AsyncClient *client);
 };
+#endif
 
 #endif /* ASYNCTCP_H_ */

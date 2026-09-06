@@ -1,8 +1,8 @@
 {
   "name": "AsyncTCP",
   "version": "3.5.0",
-  "description": "Asynchronous TCP Library for ESP32",
-  "keywords": "async,tcp",
+  "description": "Asynchronous TCP Library for ESP32 / ESP8266 / LibreTiny (mbedTLS on ESP32, BearSSL on ESP8266)",
+  "keywords": "async,tcp,tls,ssl",
   "repository": {
     "type": "git",
     "url": "https://github.com/ESP32Async/AsyncTCP.git"
