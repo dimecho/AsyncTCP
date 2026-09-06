@@ -72,9 +72,43 @@ extern "C" {
 // Number of TLS conns parked in the bounded queue (ASYNC_TCP_SSL_PARKED_SLOTS
 // slots, FIFO over the pending_pcb list).
 static volatile int s_async_parked_tls = 0;
+// Overflow-hold queue depth (ASYNC_TCP_SSL_HOLD_LIMIT, FIFO over _held).
+static volatile int s_async_held_tls = 0;
 
 uint8_t tcp_ssl_parked_count() {
-  return (uint8_t)s_async_parked_tls;
+  return (uint8_t)(s_async_parked_tls + s_async_held_tls);
+}
+
+// Page-finished flush request. SETTLED (last TLS conn drained) raises this;
+// AsyncServer::_poll drains the whole parked queue on its next tick. Parked
+// raw pcbs pin the PREVIOUS page's pre-connect/retry pbuf chains and can hold
+// free heap below the admission bar; flushing them at page-finish lets the
+// arena coalesce before the NEXT refresh burst (instead of waiting out the
+// 20s idle shed).
+static volatile bool s_shed_requested = false;
+
+void tcp_ssl_shed_parked() {
+  s_shed_requested = true;
+}
+
+// Total TLS server conns ever created (across all bursts) — SETTLED log uses
+// this to correlate the idle-heap floor with the number of conns served.
+static volatile unsigned long s_serve_conns_total = 0;
+
+unsigned long tcp_ssl_serve_conns_total() {
+  return s_serve_conns_total;
+}
+
+// Live AsyncClient shells created by the SSL serve path that have NOT been
+// deleted yet. SETTLED prints this: a value that climbs across bursts while
+// free heap ratchets down isolates per-serve object leaks (web-server request
+// objects vs our AsyncClient vs lwIP). Incremented in _serveTls on ctor
+// success, decremented in ~AsyncClient (timestamped when the object actually
+// frees), so a persistent count >0 after drain = leaked shells.
+static int s_live_serve_clients = 0;
+
+int tcp_ssl_live_serve_shells() {
+  return s_live_serve_clients;
 }
 #endif
 
@@ -1004,6 +1038,19 @@ AsyncClient::AsyncClient(tcp_pcb *pcb, BearSSL_SSL_CTX *ssl_ctx)
 #endif
 
 AsyncClient::~AsyncClient() {
+#if ASYNC_TCP_SSL_ENABLED
+  // The shellCLOSE probe + live-shell decrement MUST live in this (ESP8266)
+  // dtor — the copy in the ESP32 mbedTLS section never compiles here. Without
+  // the decrement, SETTLED's `shells` only ever climbs (tautology, read as a
+  // leak in an earlier session). With both, shells reveals the truth: 0 by the
+  // next SETTLED = AsyncClient freed on teardown, arena stable.
+  if (s_live_serve_clients) {
+    s_live_serve_clients--;
+  }
+  if (_server_discard_cb) {
+    async_tcp_log_d("shellCLOSE: live shells=%d", s_live_serve_clients);
+  }
+#endif
   if (_pcb) {
     _close();
   }
@@ -1348,6 +1395,14 @@ int8_t AsyncClient::_close() {
   _closing = true;
   tcp_pcb *pcb = _pcb;
 #if ASYNC_TCP_SSL_ENABLED
+  // Leak probe: the web server's request self-destructs ONLY on its
+  // onDisconnect (_discard_cb). Zero onDisconnect prints + zero shellCLOSE =
+  // the web request+AsyncClient pair leaks per conn. This line shows whether
+  // teardown reaches _close at all and whether the web hook is still wired.
+  async_tcp_log_d("serveClose: discard=%d server_discard=%d pcb=%p",
+                  (int)(bool)_discard_cb, (int)(bool)_server_discard_cb, (void *)pcb);
+#endif
+#if ASYNC_TCP_SSL_ENABLED
   if (_pcb_secure) {
     // A hard SENDREC stall means tcp_write() cannot allocate (memp TCP_SEG /
     // heap exhausted) — the graceful close_notify transmit below would also
@@ -1355,9 +1410,26 @@ int8_t AsyncClient::_close() {
     // In that exact state skip close_notify and tear the connection down
     // immediately so its TLS buffers are returned to the heap. Graceful close
     // is preserved for every healthy connection.
+    // ORDER MATTERS: abort the pcb FIRST — lwIP synchronously purges its
+    // queued send segments (which may reference the slab) — THEN free the TLS
+    // buffers. Freeing the slab while lwIP still drains its queue is a UAF:
+    // the next marshal copies from / chain-manipulates freed slabs, corrupting
+    // the arena (observed: force-close at free 5896 left the allocator stuck
+    // at 10528 with a lingering conn -> permanent admission-refusal latch).
     if (tcp_ssl_is_stalled(pcb, ASYNC_TCP_SSL_STALL_RESET_MS)) {
-      async_tcp_log_d("_close: skipping graceful close_notify (hard stall), freeing TLS buffers immediately.\n");
+      async_tcp_log_d("_close: skipping graceful close_notify (hard stall), resetting TCP + freeing TLS buffers immediately.\n");
+      tcp_abort(pcb);
       tcp_ssl_free(pcb);
+      _pcb = NULL;
+      _pcb_secure = false;
+      _closing = false;
+      if (_discard_cb) {
+        async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, this));
+      }
+      if (_server_discard_cb) {
+        _server_discard_cb(_server_discard_cb_arg, this);
+      }
+      return ERR_OK;
     } else {
       tcp_ssl_close(pcb);  // graceful TLS shutdown: emit close_notify before FIN (best effort)
       tcp_ssl_free(pcb);
@@ -1593,9 +1665,10 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
     return ERR_OK;
   }
 #if ASYNC_TCP_SSL_ENABLED
-  // SSL Handshake Timeout — 6s; the admission bar (SERVE_HEAP/BLOCK) means the
-  // flight usually fits, but a momentary fragmented dip can defer the record
-  // for a while. A stuck half-open handshake holds ~5.4KB of TLS buffers, so
+  // SSL Handshake Timeout — 6s; the admission gates (free >= 9K, maxblock >=
+  // slab) mean the flight usually fits, but a momentary fragmented dip can
+  // defer the record for a while. A stuck half-open handshake holds ~5.4KB of
+  // TLS buffers, so
   // still bound it.
   if (_pcb_secure && !_handshake_done && (now - _rx_last_packet) >= 6000) {
     async_tcp_log_d("SSL handshake timeout %d", pcb->state);
@@ -1979,7 +2052,7 @@ const char *AsyncClient::stateToString() const {
 AsyncServer::AsyncServer(ip_addr_t addr, uint16_t port)
   : _port(port), _addr(addr), _noDelay(false), _pcb(nullptr), _connect_cb(nullptr), _connect_cb_arg(nullptr)
 #if ASYNC_TCP_SSL_ENABLED
-    , _pending(NULL), _ssl_ctx(NULL), _file_cb(NULL), _file_cb_arg(NULL)
+    , _pending(NULL), _held(NULL), _ssl_ctx(NULL), _file_cb(NULL), _file_cb_arg(NULL)
 #endif
 {
 }
@@ -1987,7 +2060,7 @@ AsyncServer::AsyncServer(ip_addr_t addr, uint16_t port)
 #ifdef ARDUINO
 AsyncServer::AsyncServer(IPAddress addr, uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0)
 #if ASYNC_TCP_SSL_ENABLED
-                                                          , _pending(NULL), _ssl_ctx(NULL), _file_cb(NULL), _file_cb_arg(NULL)
+                                                          , _pending(NULL), _held(NULL), _ssl_ctx(NULL), _file_cb(NULL), _file_cb_arg(NULL)
 #endif
 {
 #if ESP_IDF_VERSION_MAJOR < 5
@@ -2004,7 +2077,7 @@ AsyncServer::AsyncServer(IPAddress addr, uint16_t port) : _port(port), _noDelay(
 #if ESP_IDF_VERSION_MAJOR < 5 && __has_include(<IPv6Address.h>) && LWIP_IPV6
 AsyncServer::AsyncServer(IPv6Address addr, uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0)
 #if ASYNC_TCP_SSL_ENABLED
-                                                           , _pending(NULL), _ssl_ctx(NULL), _file_cb(NULL), _file_cb_arg(NULL)
+                                                           , _pending(NULL), _held(NULL), _ssl_ctx(NULL), _file_cb(NULL), _file_cb_arg(NULL)
 #endif
 {
 #if LWIP_IPV4 && LWIP_IPV6
@@ -2018,7 +2091,7 @@ AsyncServer::AsyncServer(IPv6Address addr, uint16_t port) : _port(port), _noDela
 
 AsyncServer::AsyncServer(uint16_t port) : _port(port), _noDelay(false), _pcb(0), _connect_cb(0), _connect_cb_arg(0)
 #if ASYNC_TCP_SSL_ENABLED
-                                          , _pending(NULL), _ssl_ctx(NULL), _file_cb(NULL), _file_cb_arg(NULL)
+                                          , _pending(NULL), _held(NULL), _ssl_ctx(NULL), _file_cb(NULL), _file_cb_arg(NULL)
 #endif
 {
 #if LWIP_IPV4 && LWIP_IPV6
@@ -2127,6 +2200,45 @@ static void unlink_pending(struct pending_pcb **headptr, struct pending_pcb *p) 
   }
 }
 
+// Frees a whole queued list's bookkeeping (pbufs + items) WITHOUT touching the
+// pcbs — used by _error (lwIP already freed the errored pcb) and end().
+static void free_queued_items(struct pending_pcb **list, volatile int *count) {
+  while (*list) {
+    struct pending_pcb *p = *list;
+    *list = p->next;
+    if (p->pb) {
+      pbuf_free(p->pb);
+    }
+    (*count)--;
+    free(p);
+  }
+}
+
+// Sheds a whole queued list: nulls callbacks, aborts each pcb (RST) and frees
+// bookkeeping. Used by the SETTLED arena flush.
+static int abort_queued_items(struct pending_pcb **list, volatile int *count) {
+  int n = 0;
+  while (*list) {
+    struct pending_pcb *p = *list;
+    *list = p->next;
+    tcp_pcb *spcb = p->pcb;
+    if (p->pb) {
+      pbuf_free(p->pb);
+    }
+    (*count)--;
+    if (spcb) {
+      tcp_arg(spcb, NULL);
+      tcp_recv(spcb, NULL);
+      tcp_poll(spcb, NULL, 0);
+      tcp_err(spcb, NULL);
+      tcp_abort(spcb);
+    }
+    free(p);
+    n++;
+  }
+  return n;
+}
+
 void AsyncServer::end() {
   if (_pcb) {
     tcp_core_guard tcg;
@@ -2141,17 +2253,10 @@ void AsyncServer::end() {
   if (_ssl_ctx) {
     delete _ssl_ctx;
     _ssl_ctx = NULL;
-    // Drain the parked queue (raw pcbs + possibly-buffered request pbufs)
+    // Drain the queued lists (raw pcbs + possibly-buffered request pbufs)
     // to return their memory at teardown.
-    while (_pending) {
-      struct pending_pcb *p = _pending;
-      _pending = p->next;
-      if (p->pb) {
-        pbuf_free(p->pb);
-      }
-      s_async_parked_tls--;
-      free(p);
-    }
+    free_queued_items(&_pending, &s_async_parked_tls);
+    free_queued_items(&_held, &s_async_held_tls);
   }
 #endif
 }
@@ -2238,55 +2343,99 @@ int8_t AsyncServer::_accept(tcp_pcb *pcb, int8_t err) {
       }
       return ERR_OK;
     }
-    // Admission: ONE live TLS conn + a bounded parked queue
-    // (ASYNC_TCP_SSL_PARKED_SLOTS entries). While a conn is active, extra
-    // conns are parked as raw pcbs (NO SSL buffers yet) and promoted FIFO
-    // the moment the slot frees and heap clears the bar. Slots are shed after
-    // ASYNC_TCP_SSL_QUEUE_IDLE_MS if never promoted. SERVE_HEAP/SERVE_BLOCK
-    // (8.5K / slab) so a conn never ctors into a churned arena mid-close.
+    // Admission: ONE live TLS conn + staged park queue (PARKED_SLOTS) +
+    // overflow hold queue (HOLD_LIMIT). While a conn is active, extra conns are
+    // queued as raw pcbs (NO SSL buffers yet) and promoted FIFO the moment the
+    // slot frees and heap clears the bar (free >= 9K && maxblock >= slab size),
+    // so a conn never ctors into a churned arena mid-close. Queue slots are
+    // shed after ASYNC_TCP_SSL_QUEUE_IDLE_MS if never promoted.
     if (tcp_ssl_client_count() > 0) {
-      if (s_async_parked_tls < ASYNC_TCP_SSL_PARKED_SLOTS) {
-        struct pending_pcb *new_item = (struct pending_pcb *)malloc(sizeof(struct pending_pcb));
-        if (!new_item) {
-          async_tcp_log_d("_accept: malloc new pending failed!");
-          tcp_arg(pcb, NULL);
-          if (tcp_close(pcb) != ERR_OK) {
-            tcp_abort(pcb);
-            return ERR_ABRT;
+      // Pressure-aware parking: while the live conn is serving, prefer the
+      // staged park queue only when free heap >= floor (a staged slot pins
+      // ~5.2KB of pbuf/ClientHello that a struggling live conn may need for its
+      // next record). Under the floor, or when the park queue is full, the
+      // conn falls to the overflow-hold tier instead of being RST'd — same
+      // pool-only buffering, no heap, bounded by HOLD_LIMIT.
+      struct pending_pcb *new_item = NULL;
+      if (s_async_parked_tls < ASYNC_TCP_SSL_PARKED_SLOTS &&
+          (unsigned)ESP.getFreeHeap() >= ASYNC_TCP_SSL_PRESSURE_PARK_FLOOR) {
+        new_item = (struct pending_pcb *)malloc(sizeof(struct pending_pcb));
+        if (new_item) {
+          new_item->pcb = pcb;
+          new_item->pb = NULL;
+          new_item->pb_len = 0;
+          new_item->parked_ms = millis();
+          new_item->next = NULL;
+          tcp_arg(pcb, this);
+          tcp_poll(pcb, &_s_poll, 1);
+          tcp_recv(pcb, &_s_recv);
+          tcp_err(pcb, &_s_error);
+          // Append at the tail so _promoteSlot lifts in arrival order (FIFO).
+          if (!_pending) {
+            _pending = new_item;
+          } else {
+            struct pending_pcb *tail = _pending;
+            while (tail->next) {
+              tail = tail->next;
+            }
+            tail->next = new_item;
           }
+          s_async_parked_tls++;
+          async_tcp_log_d("_accept: live conn, queued new conn (queued=%u/%d)", s_async_parked_tls, ASYNC_TCP_SSL_PARKED_SLOTS);
           return ERR_OK;
         }
-        new_item->pcb = pcb;
-        new_item->pb = NULL;
-        new_item->pb_len = 0;
-        new_item->parked_ms = millis();
-        new_item->next = NULL;
-        tcp_arg(pcb, this);
-        tcp_poll(pcb, &_s_poll, 1);
-        tcp_recv(pcb, &_s_recv);
-        tcp_err(pcb, &_s_error);
-        // Append at the tail so _promoteSlot lifts in arrival order (FIFO).
-        if (!_pending) {
-          _pending = new_item;
-        } else {
-          struct pending_pcb *tail = _pending;
-          while (tail->next) {
-            tail = tail->next;
-          }
-          tail->next = new_item;
-        }
-        s_async_parked_tls++;
-        async_tcp_log_d("_accept: live conn, queued new conn (queued=%u/%d)", s_async_parked_tls, ASYNC_TCP_SSL_PARKED_SLOTS);
-        return ERR_OK;
       }
-      // Queue full — RST; nothing served yet, browser retries later.
-      async_tcp_log_d("_accept: queue busy (%u/%d), refusing TLS conn", s_async_parked_tls, ASYNC_TCP_SSL_PARKED_SLOTS);
+      // Wedged-staged or park full -> overflow-held tier: same buffering as a
+      // park slot (pool pbufs only; no heap beyond the 24B pending_pcb) but
+      // admitted even when free heap < floor, so a tight arena never RSTs a
+      // newcomer. Costs only pooled pbufs — bounded by HOLD_LIMIT.
+      if (!new_item && s_async_held_tls < ASYNC_TCP_SSL_HOLD_LIMIT) {
+        new_item = (struct pending_pcb *)malloc(sizeof(struct pending_pcb));
+        if (new_item) {
+          new_item->pcb = pcb;
+          new_item->pb = NULL;
+          new_item->pb_len = 0;
+          new_item->parked_ms = millis();
+          new_item->next = NULL;
+          tcp_arg(pcb, this);
+          tcp_poll(pcb, &_s_poll, 1);
+          tcp_recv(pcb, &_s_recv);
+          tcp_err(pcb, &_s_error);
+          if (!_held) {
+            _held = new_item;
+          } else {
+            struct pending_pcb *tail = _held;
+            while (tail->next) {
+              tail = tail->next;
+            }
+            tail->next = new_item;
+          }
+          s_async_held_tls++;
+          async_tcp_log_d("_accept: live conn, held overflow conn (held=%u/%d)", s_async_held_tls, ASYNC_TCP_SSL_HOLD_LIMIT);
+          return ERR_OK;
+        }
+      }
+      // Genuinely overloaded (staged+held both full) — RST; browser retry backs
+      // off instead of instantly re-parking.
+      async_tcp_log_d("_accept: queue busy (queued=%u/%d held=%u/%d), refusing TLS conn", s_async_parked_tls, ASYNC_TCP_SSL_PARKED_SLOTS, s_async_held_tls, ASYNC_TCP_SSL_HOLD_LIMIT);
       tcp_abort(pcb);
       return ERR_ABRT;
     }
-    if ((unsigned)ESP.getFreeHeap() < ASYNC_TCP_SSL_SERVE_HEAP ||
+    if ((unsigned)ESP.getFreeHeap() < ASYNC_TCP_SSL_PRESSURE_PARK_FLOOR ||
         (unsigned)ESP.getMaxFreeBlockSize() < ASYNC_TCP_SSL_SERVE_BLOCK) {
-      async_tcp_log_d("_accept: freeheap=%u/%u critical, refusing TLS conn", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize());
+      // Serve gate, two checks:
+      //  - free heap >= 9000: don't start a serve that runs the arena to its
+      //    crash point mid-flight (1072B alloc fail at ~4.5K = exception 29).
+      //  - maxblock >= slab (4506): the ctor needs one contiguous slab; a
+      //    fragmented arena below this aborts the conn and that asset's
+      //    retries keep missing -> intermittent "some .js not loading".
+      // Slab-sized does NOT latch (the old 9000-contiguity gate did): after a
+      // conn closes, its freed slab is reused in place, so the hole always
+      // exists even fully fragmented. Never raise to slab+margin — that
+      // deadlocks (freed in-place hole ~4190 < slab+margin forever).
+      unsigned active = 0, tw = 0;
+      tcp_ssl_pcb_pressure(&active, &tw);
+      async_tcp_log_d("_accept: freeheap=%u maxblock=%u below serve floor, refusing TLS conn (active=%u tw=%u)", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize(), active, tw);
       tcp_abort(pcb);
       return ERR_ABRT;
     }
@@ -2321,6 +2470,8 @@ AsyncClient *AsyncServer::_serveTls(tcp_pcb *pcb) {
   // NULL (pcb closed) if allocation fails — browser simply retries.
   AsyncClient *c = new (std::nothrow) AsyncClient(pcb, _ssl_ctx);
   if (c) {
+    s_live_serve_clients++;
+    s_serve_conns_total++;
     if (!c->_pcb) {
       // Ctor could not init the TLS engine (heap allocation failed) and
       // already closed the pcb. Drop the empty shell — this both avoids a
@@ -2364,15 +2515,23 @@ int AsyncServer::_s_cert(void *arg, const char *filename, uint8_t **buf) {
 }
 
 int8_t AsyncServer::_poll(tcp_pcb *pcb) {
-  // Queue driver for the parked conns. Promotes the HEAD slot (FIFO) the
-  // moment the live conn is gone and heap clears the bar; sheds any slot that
-  // sat parked past the idle timeout.
+  // Queue driver for the queued conns (staged park + overflow hold). Promotes
+  // the head (staged FIFO first, then held) the moment the live conn is gone
+  // and heap clears the bar; sheds any slot that sat queued past idle.
   struct pending_pcb *p = _pending;
+  bool in_held = false;
   while (p && p->pcb != pcb) {
     p = p->next;
   }
   if (!p) {
-    // Orphaned pcb: a peer-error on another slot cleared the whole queue, but
+    p = _held;
+    in_held = true;
+    while (p && p->pcb != pcb) {
+      p = p->next;
+    }
+  }
+  if (!p) {
+    // Orphaned pcb: a peer-error on another slot cleared both queues, but
     // this pcb survived. Walked by our poll tick — close it so the tcp_pcb
     // isn't leaked (lwIP leaves callbacks set, so we must null them first).
     tcp_arg(pcb, NULL);
@@ -2386,22 +2545,35 @@ int8_t AsyncServer::_poll(tcp_pcb *pcb) {
     return ERR_ABRT;
   }
 
-  bool is_head = (p == _pending);
-  if (is_head && tcp_ssl_client_count() == 0 &&
-      (unsigned)ESP.getFreeHeap() >= ASYNC_TCP_SSL_SERVE_HEAP &&
-      (unsigned)ESP.getMaxFreeBlockSize() >= ASYNC_TCP_SSL_SERVE_BLOCK) {
-    // Live conn closed and free heap clears the bar -> promote the head.
+  bool is_head = (in_held ? (p == _held) : (p == _pending));
+  // Page-finished flush: a SETTLED drain (count hit 0) requested we shed the
+  // whole queue so the arena coalesces before the next refresh burst. Queued
+  // pcbs are retry-able (browser reconnects), so RST'ing them is safe.
+  if (tcp_ssl_client_count() == 0 && s_shed_requested) {
+    s_shed_requested = false;
+    int shed = abort_queued_items(&_pending, &s_async_parked_tls) +
+               abort_queued_items(&_held, &s_async_held_tls);
+    async_tcp_log_d("_poll: shed %d queued (arena flush after page done), freeheap=%u, maxblock=%u",
+                    shed, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize());
+    // Our pcb was in the drained set (every queued pcb is drained) — abort.
+    return ERR_ABRT;
+  }
+  if (is_head && tcp_ssl_client_count() == 0) {
     return _promoteSlot();
   }
 
-  // Slot parked past idle timeout -> live conn wedged; shed so pcb+pbufs
+  // Slot queued past idle timeout -> live conn wedged; shed so pcb+pbufs
   // return to the heap and the browser retries on a fresh connection.
   if ((uint32_t)(millis() - p->parked_ms) < ASYNC_TCP_SSL_QUEUE_IDLE_MS) {
     return ERR_OK;
   }
-  unlink_pending(&_pending, p);
-  s_async_parked_tls--;
-  async_tcp_log_d("_poll: shedding queued conn (parked=%ums, freeheap=%u, maxblock=%u)", (unsigned)(millis() - p->parked_ms), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize());
+  unlink_pending(in_held ? &_held : &_pending, p);
+  if (in_held) {
+    s_async_held_tls--;
+  } else {
+    s_async_parked_tls--;
+  }
+  async_tcp_log_d("_poll: shedding queued conn (held=%d, parked=%ums, freeheap=%u, maxblock=%u)", in_held ? 1 : 0, (unsigned)(millis() - p->parked_ms), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize());
   if (p->pb) {
     pbuf_free(p->pb);
     p->pb = NULL;
@@ -2473,41 +2645,57 @@ int8_t AsyncServer::_recv(struct tcp_pcb *pcb, struct pbuf *pb, int8_t err) {
 
 void AsyncServer::_error(int8_t err) {
   (void)err;
-  // Peer reset/errored a parked raw pcb before promotion; lwIP already freed
+  // Peer reset/errored a queued raw pcb before promotion; lwIP already freed
   // that pcb (tcp_err carries no pcb), so release only our bookkeeping.
-  // With a multi-slot queue we can't tell WHICH pcb errored — clear the whole
-  // queue. Any parked pcb that survived its peer's teardown is orphaned and
+  // With a multi-slot queue we can't tell WHICH pcb errored — clear both
+  // queues. Any queued pcb that survived its peer's teardown is orphaned and
   // gets shed+closed by _poll on its next 1s tick, so nothing leaks.
-  while (_pending) {
-    struct pending_pcb *p = _pending;
-    _pending = p->next;
-    if (p->pb) {
-      pbuf_free(p->pb);
-      p->pb = NULL;
-    }
-    s_async_parked_tls--;
-    free(p);
-  }
+  free_queued_items(&_pending, &s_async_parked_tls);
+  free_queued_items(&_held, &s_async_held_tls);
 }
 
 int8_t AsyncServer::_promoteSlot() {
-  // Lifts the queued raw PCB at the head (FIFO) to a live AsyncClient. Runs
-  // whenever the live conn is gone (TLS buffers freed, ssl_count==0) and heap
-  // clears the bar — either from _poll's tick or instantly from _conn_done.
-  if (!_pending || tcp_ssl_client_count() != 0 ||
-      (unsigned)ESP.getFreeHeap() < ASYNC_TCP_SSL_SERVE_HEAP ||
-      (unsigned)ESP.getMaxFreeBlockSize() < ASYNC_TCP_SSL_SERVE_BLOCK) {
+  // Lifts the queued raw PCB at the head to a live AsyncClient: staged park
+  // slots first (their ClientHello is already buffered -> fastest handshake),
+  // otherwise the held-overflow head. Runs whenever the live conn is gone
+  // (TLS buffers freed, ssl_count==0) — either from _poll's tick or instantly
+  // from _conn_done. No heap bar below the serving floor: _serveTls is
+  // allocation-gated (nothrow fails cleanly, pcb aborted, retried), but a
+  // serve burns several KB mid-flight, so below PRESSURE_PARK_FLOOR we keep
+  // the slot queued and retry on the next tick — the arena recovers to its
+  // floor after each conn frees its TLS buffers.
+  if (tcp_ssl_client_count() != 0) {
     return ERR_OK;
   }
-  struct pending_pcb *p = _pending;
+  struct pending_pcb **list = (s_async_parked_tls > 0) ? &_pending : &_held;
+  if (!*list) {
+    return ERR_OK;
+  }
+#if ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_SERVER
+  // Same serve gate as _accept: free heap >= 9000 AND maxblock >= slab.
+  // Slab-sized doesn't latch (freed slabs reuse in place); raising it to 9000
+  // or slab+margin deadlocks. Below it, keep queued, retry next tick.
+  if ((unsigned)ESP.getFreeHeap() < ASYNC_TCP_SSL_PRESSURE_PARK_FLOOR ||
+      (unsigned)ESP.getMaxFreeBlockSize() < ASYNC_TCP_SSL_SERVE_BLOCK) {
+    async_tcp_log_d("_promoteSlot: freeheap=%u maxblock=%u below serve floor, keeping slot queued", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize());
+    return ERR_OK;
+  }
+#endif
+  bool was_held = (list == &_held);
+  struct pending_pcb *p = *list;
   tcp_pcb *pcb = p->pcb;
-  _pending = p->next;  // next parked slot slides into the head
-  s_async_parked_tls--;
+  *list = p->next;  // next queued conn slides into the head
+  if (was_held) {
+    s_async_held_tls--;
+  } else {
+    s_async_parked_tls--;
+  }
   AsyncClient *c = _serveTls(pcb);
   err_t err = ERR_OK;
   if (c) {
     // Feed the request-header pbufs that arrived while queued straight into
-    // the now-live client (ClientHello sits at the head).
+    // the now-live client (ClientHello sits at the head) — staged and held
+    // conns alike.
     if (p->pb) {
       c->_recv(pcb, p->pb, 0);
     }
@@ -3540,6 +3728,17 @@ AsyncClient::AsyncClient(tcp_pcb *pcb)
 
 AsyncClient::~AsyncClient() {
 #if ASYNC_TCP_SSL_ENABLED
+  bool was_serve_shell = (_server_discard_cb != nullptr);
+  if (s_live_serve_clients) {
+    s_live_serve_clients--;
+  }
+  // Leak probe: SETTLED prints rising `shells` because the web server deletes
+  // the shell on the main loop — AFTER our drain print. This line proves
+  // whether shells are freed late (shellCLOSE keeps appearing, arena recovers)
+  // or never (zero shellCLOSE lines -> a leaked AsyncClient per conn).
+  if (was_serve_shell) {
+    async_tcp_log_d("shellCLOSE: live shells=%d", s_live_serve_clients);
+  }
   if (_ssl_pending_pbufs) {
     pbuf_free(_ssl_pending_pbufs);
     _ssl_pending_pbufs = NULL;

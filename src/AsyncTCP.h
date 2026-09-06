@@ -406,7 +406,8 @@ protected:
   AcConnectHandler _connect_cb;
   void *_connect_cb_arg;
 #if ASYNC_TCP_SSL_ENABLED
-  struct pending_pcb *_pending;
+  struct pending_pcb *_pending;  // staged/parked queue (p->pb buffered)
+  struct pending_pcb *_held;      // overflow-hold queue (no recv cb; pool-only)
   BearSSL_SSL_CTX *_ssl_ctx;
   AcSSLFileHandler _file_cb;
   void *_file_cb_arg;

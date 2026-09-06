@@ -38,6 +38,12 @@
 #if ASYNC_TCP_SSL_ENABLED
 #include "AsyncTCPLogging.h"
 
+// br_ssl_engine_new_max_frag_len() is declared in BearSSL's internal C-only
+// header (inner.h), which cannot be included from C++. Declare it here with
+// correct C linkage so the forced/offered-MFLN paths (server + client) link
+// against the C-compiled BearSSL object.
+extern "C" void br_ssl_engine_new_max_frag_len(br_ssl_engine_context* rc, unsigned max_frag_len);
+
 #include <StackThunk.h>
 #include <ESP8266WiFi.h>  // ESP object (ESP.getFreeHeap) + core <BearSSLHelpers.h> -> complete BearSSL::PrivateKey (safe delete in ~BearSSL_SSL_CTX)
 #include <bearssl/bearssl_pem.h>
@@ -85,6 +91,26 @@ BearSSL_SSL_CTX::~BearSSL_SSL_CTX() {
 // Linked list of all active BearSSL connections
 tcp_ssl_pcb* tcp_ssl_pcbs = nullptr;
 
+// lwIP TCP-PCB pool diagnostics. A burst of graceful closes parks each
+// connection's pcb in TIME_WAIT for 2*MSL (~120s); with the ESP8266's small
+// MEMP_NUM_TCP_PCB pool that exhausts after ~2 bursts and new SYNs are
+// silently dropped INSIDE lwIP (our accept callback never fires). Counting the
+// chain heads tells heap-pressure (SETTLED free low) apart from pcb-pressure
+// (active+tw near pool limit) at the exact stuck moment.
+static void lwip_pcb_counts(unsigned *active, unsigned *tw) {
+  extern struct tcp_pcb *tcp_active_pcbs;
+  extern struct tcp_pcb *tcp_tw_pcbs;
+  unsigned a = 0, t = 0;
+  for (struct tcp_pcb *it = tcp_active_pcbs; it; it = (struct tcp_pcb *)it->next) a++;
+  for (struct tcp_pcb *it = tcp_tw_pcbs; it; it = (struct tcp_pcb *)it->next) t++;
+  *active = a;
+  *tw = t;
+}
+
+void tcp_ssl_pcb_pressure(unsigned *active, unsigned *tw) {
+  lwip_pcb_counts(active, tw);
+}
+
 // Helper to find an SSL connection's state from its lwIP pcb
 tcp_ssl_pcb* find_ssl_pcb(struct tcp_pcb* pcb) {
   tcp_ssl_pcb* iter = tcp_ssl_pcbs;
@@ -109,6 +135,7 @@ tcp_ssl_pcb* tcp_ssl_alloc_pcb(struct tcp_pcb* pcb, bool is_server) {
   ssl_pcb->is_server = is_server;
 #if ASYNC_TCP_SSL_ENABLE_CLIENT
   ssl_pcb->sc_client = nullptr;
+  ssl_pcb->insecure_x509 = nullptr;
 #endif
 #if ASYNC_TCP_SSL_ENABLE_SERVER
   ssl_pcb->sc_server = nullptr;
@@ -136,9 +163,9 @@ tcp_ssl_pcb* tcp_ssl_alloc_pcb(struct tcp_pcb* pcb, bool is_server) {
   ssl_pcb->max_rec_len = 0;
 
   // ONE contiguous allocation for inbuf + record ring + accumulator. A single
-  // ~8.5KB slab needs one big heap hole instead of three separate allocs, so
+  // ~4.5KB slab needs one big heap hole instead of three separate allocs, so
   // the admission BLOCK bar can guarantee the whole conn fits in one piece.
-  ssl_pcb->recvrec_accum_cap = ASYNC_TCP_SSL_IN_BUFFER_SIZE;
+  ssl_pcb->recvrec_accum_cap = ASYNC_TCP_SSL_ACCUM_BUFFER_SIZE;
   ssl_pcb->inbuf_cap = ASYNC_TCP_SSL_IN_BUFFER_SIZE;
   ssl_pcb->_slab = new (std::nothrow) unsigned char[ASYNC_TCP_SSL_BUFFER_SLAB];
   if (!ssl_pcb->_slab) {
@@ -294,10 +321,25 @@ int tcp_ssl_free(struct tcp_pcb* pcb) {
       async_tcp_log_i("INREC-FINAL: max record len=%u, free heap=%u\n",
                       (unsigned)iter->max_rec_len, (unsigned)ESP.getFreeHeap());
 #if ASYNC_TCP_SSL_ENABLE_CLIENT
-      delete iter->insecure_x509;
+      // insecure_x509 freed by ~tcp_ssl_pcb
 #endif
       delete iter;
       async_tcp_log_d("FREE: free heap=%u\n", (unsigned)ESP.getFreeHeap());
+      if (!tcp_ssl_pcbs) {
+        // All TLS conns drained: print the true idle floor + lwIP pcb-pressure,
+        // then ask the server to flush its parked queue (parked pcbs pin the
+        // previous page's pbuf chains and can hold free heap below the bar).
+        // Compare SETTLED free across bursts (heap leak) vs tw-count climbing
+        // toward the MEMP pool (pcb exhaustion -> 3rd-burst drop).
+        unsigned active = 0, tw = 0;
+        lwip_pcb_counts(&active, &tw);
+        async_tcp_log_i("SETTLED: conns=%lu, parked=%u, free heap=%u, maxblock=%u, frag=%u%%, shells=%d, active=%u, tw=%u\n",
+                        tcp_ssl_serve_conns_total(), tcp_ssl_parked_count(),
+                        (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize(),
+                        (unsigned)ESP.getHeapFragmentation(), tcp_ssl_live_serve_shells(),
+                        active, tw);
+        tcp_ssl_shed_parked();
+      }
       return 0;
     }
     prev = iter;
@@ -775,7 +817,7 @@ int tcp_ssl_read(struct tcp_pcb* pcb, struct pbuf* pb) {
   size_t pb_offset = 0;
 
   while (remaining > 0) {
-    size_t accum_space = ASYNC_TCP_SSL_IN_BUFFER_SIZE - ssl_pcb->recvrec_accum_len;
+    size_t accum_space = ASYNC_TCP_SSL_ACCUM_BUFFER_SIZE - ssl_pcb->recvrec_accum_len;
     if (accum_space == 0) {
       // Accumulator full — schedule engine to drain, then retry
       schedule_ssl_engine(ssl_pcb);
@@ -1039,6 +1081,12 @@ int tcp_ssl_new_client(struct tcp_pcb* pcb, const char* host, const br_x509_clas
 
   br_ssl_client_base_init(ssl_pcb->sc_client, suites_P, sizeof(suites_P) / sizeof(suites_P[0]));
 
+#if ASYNC_TCP_SSL_CLIENT_MFLN
+  // Offer max_fragment_length (RFC 6066) to the mail server; must precede
+  // br_ssl_client_reset (handshake start).
+  br_ssl_engine_new_max_frag_len(&ssl_pcb->sc_client->eng, ASYNC_TCP_SSL_CLIENT_MFLN);
+#endif
+
   // Install x509 validator. When the caller supplies none (rootCA == NULL),
   // install the accept-any insecure decoder — mirrors mbedTLS
   // beginSecure(host, port, rootCA=NULL), i.e. no server-cert verification.
@@ -1060,8 +1108,7 @@ int tcp_ssl_new_client(struct tcp_pcb* pcb, const char* host, const br_x509_clas
 
   // Set server name for SNI (required for TLS 1.2+)
   if(!br_ssl_client_reset(ssl_pcb->sc_client, host, 0)) {
-    delete ssl_pcb->insecure_x509;
-    delete ssl_pcb;
+    delete ssl_pcb;  // ~tcp_ssl_pcb frees _slab, sc_client, insecure_x509
     return -1;
   }
 
@@ -1105,12 +1152,6 @@ int tcp_ssl_new_client(struct tcp_pcb* pcb, const char* host, const br_x509_clas
 #include <Schedule.h>  // schedule_function()
 
 #include <memory>  // For std::unique_ptr (PROGMEM patch)
-
-// br_ssl_engine_new_max_frag_len() is declared in BearSSL's internal
-// C-only header (inner.h), which cannot be included from C++. Declare it here
-// with correct C linkage so the forced-MFLN path below links against the
-// C-compiled BearSSL object.
-extern "C" void br_ssl_engine_new_max_frag_len(br_ssl_engine_context* rc, unsigned max_frag_len);
 
 // Fwd decl: defined below; used once at ctx build to init the shared engine.
 static void br_ssl_server_init_lean(br_ssl_server_context* cc,
