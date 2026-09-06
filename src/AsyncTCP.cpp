@@ -3728,17 +3728,6 @@ AsyncClient::AsyncClient(tcp_pcb *pcb)
 
 AsyncClient::~AsyncClient() {
 #if ASYNC_TCP_SSL_ENABLED
-  bool was_serve_shell = (_server_discard_cb != nullptr);
-  if (s_live_serve_clients) {
-    s_live_serve_clients--;
-  }
-  // Leak probe: SETTLED prints rising `shells` because the web server deletes
-  // the shell on the main loop — AFTER our drain print. This line proves
-  // whether shells are freed late (shellCLOSE keeps appearing, arena recovers)
-  // or never (zero shellCLOSE lines -> a leaked AsyncClient per conn).
-  if (was_serve_shell) {
-    async_tcp_log_d("shellCLOSE: live shells=%d", s_live_serve_clients);
-  }
   if (_ssl_pending_pbufs) {
     pbuf_free(_ssl_pending_pbufs);
     _ssl_pending_pbufs = NULL;
