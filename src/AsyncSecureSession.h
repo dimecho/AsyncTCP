@@ -64,24 +64,36 @@
 #undef SSL_MAX_CONNECTIONS
 #define SSL_MAX_CONNECTIONS 1
 
-#ifndef SSL_HANDSHAKE_TIMEOUT
+// ESP8266: aggressive client rx-echo cutoff (slow browser under heap pressure
+// during OTA chunk handshakes gets 2s, not the shared 10s).
+#undef SSL_HANDSHAKE_TIMEOUT
 #define SSL_HANDSHAKE_TIMEOUT 2000
-#endif
 
-// Inbound I/O buffer. Must fit the browser's ClientHello (~1870B on wire;
-// 2048 covers it; MFLN caps everything else at 1024+overhead).
+// CLIENT-role inbound record buffer. This role offers MFLN (SSL_CLIENT_MFLN),
+// so the peer caps records at 1024+overhead; 2048 covers ClientHello + any
+// peer that ignores MFLN.
 #ifndef SSL_IN_BUFFER_SIZE
 #define SSL_IN_BUFFER_SIZE 2048
+#endif
+
+// SERVER-role inbound record buffer. Browsers never send max_fragment_length
+// (RFC 6066 is client-optional), so a full 16KB record would need ~17.5KB of
+// slab and blow the ESP8266's ~20KB free heap mid-handshake (OOM). The OTA
+// uploader is chunked instead (small POST bodies -> small TLS records), so the
+// server buffer only needs to hold those small records: 4096 is enough. 4096 +
+// the 1109 out-record ring = 5205B server slab, which fits the serve-time arena.
+#ifndef SSL_SERVER_IN_BUFFER_SIZE
+#define SSL_SERVER_IN_BUFFER_SIZE 4096
 #endif
 
 #ifndef SSL_OUT_BUFFER_SIZE
 #define SSL_OUT_BUFFER_SIZE 1109
 #endif
 
-// Record-reassembly accumulator: must hold one full inbound record (stalls
-// handshake if too small). Sized to match the IN buffer.
-#ifndef SSL_ACCUM_BUFFER_SIZE
-#define SSL_ACCUM_BUFFER_SIZE 2048
+// Max lwIP pbufs queued unconsumed while the engine feeds (loop context).
+// Credit-only-consumed backpressure chokes the peer's window before this.
+#ifndef SSL_RX_PEND_MAX
+#define SSL_RX_PEND_MAX 16
 #endif
 
 // Outbound record ring depth (K slots per conn). K=2 = +1109B/slab and
@@ -90,25 +102,37 @@
 #define SSL_RECORD_RING_SLOTS 1
 #endif
 
-// inbuf + K-slot ring + accumulator share ONE slab: one contiguous hole for
-// the ctor, which the SERVE_BLOCK admission bar checks.
+// Outbound ring region: K slots x record size.
 #ifndef SSL_OUT_BUFFER_REGION
 #define SSL_OUT_BUFFER_REGION \
   (SSL_RECORD_RING_SLOTS * SSL_OUT_BUFFER_SIZE)
 #endif
-#ifndef SSL_BUFFER_SLAB
-#define SSL_BUFFER_SLAB \
-  (SSL_IN_BUFFER_SIZE + SSL_OUT_BUFFER_REGION + SSL_ACCUM_BUFFER_SIZE)
+
+// Server-role slab: record buffers for BOTH directions share ONE hole so the
+// ctor needs a single contiguous alloc the SERVE_BLOCK admission bar can gate
+// (this is the bar the ESP8266 arena must produce at serve time). Client conns
+// allocate their own (smaller) slab at runtime.
+#ifndef SSL_BUFFER_SLAB_SERVER
+#define SSL_BUFFER_SLAB_SERVER \
+  (SSL_SERVER_IN_BUFFER_SIZE + SSL_OUT_BUFFER_REGION)
+#endif
+#ifndef SSL_BUFFER_SLAB_CLIENT
+#define SSL_BUFFER_SLAB_CLIENT \
+  (SSL_IN_BUFFER_SIZE + SSL_OUT_BUFFER_REGION)
+#endif
+// Admission bar (server-side): must equal the server slab or the gate refusals
+// deadlock every later conn.
+#ifndef SSL_SERVE_BLOCK
+#define SSL_SERVE_BLOCK SSL_BUFFER_SLAB_SERVER
 #endif
 
-// Server MFLN caps outbound records (plaintext), incl. the Certificate
-// flight; 1109B ring + 2048B accumulator force 1024.
-#undef SSL_SERVER_MFLN
-#define SSL_SERVER_MFLN 1024
+// No server MFLN (RFC 6066): browsers never offer max_fragment_length, so a
+// ServerHello echo is pointless and a forced cap would be ignored by the most
+// common clients. Server outbound records are already limited by the 1109B
+// output ring; inbound records are bounded by the server inbuf.
 
-// Client MFLN offered outbound; keeps INBOUND records <= accumulator.
-#undef SSL_CLIENT_MFLN
-#define SSL_CLIENT_MFLN 1024
+// Client MFLN offered outbound; keeps inbound peer records <= client inbuf
+// (spelled in the shared config above; no server counterpart — see note above).
 
 // Force-close for a serve with zero engine progress (e.g. send-pool stall).
 // Too low aborts healthy conns; 20s lets lwIP recovery drain it.
@@ -117,17 +141,27 @@
 #endif
 
 // Min free heap to accept/park/promote a TLS conn; below it refuse (RST).
-// Parked slots pin ~5.2KB each + serve burns KBs mid-flight; alloc at
-// ~4.5K free crashed the device. Contiguity gated separately by
-// SSL_SERVE_BLOCK (== slab size, never 9000 — that latched).
+// Parked slots pin ~5.2KB each (4096 in + 1109 out); alloc below ~4.5K free
+// crashed the device. Contiguity gated separately by SSL_SERVE_BLOCK (== the
+// server slab via SSL_BUFFER_SLAB_SERVER). Keeps ~3.8K free headroom after one
+// slab alloc.
 #ifndef SSL_PRESSURE_PARK_FLOOR
-#define SSL_PRESSURE_PARK_FLOOR 9000
+#define SSL_PRESSURE_PARK_FLOOR (SSL_BUFFER_SLAB_SERVER + 3800)  // ≈ 9005 B
 #endif
 
-// Parked-conn queue depth; each slot pins ~4KB (pcb + RX pbufs). 4 starved
-// the arena; 2 absorbed a page's parallel conns with room to promote.
+// Absolute floor below which the server refuses a conn outright (RST) instead
+// of even queuing the 24B HOLD pending_pcb — at ~976B free a 24-32B malloc
+// throws an unhandled C++ OOM on ESP8266. Keeps the overflow-held tier from
+// crashing a conn that is otherwise surviving on heartbeat budget.
+#ifndef SSL_HOLD_MIN_HEAP
+#define SSL_HOLD_MIN_HEAP 2000
+#endif
+
+// Parked-conn queue depth; each slot pins ~4KB (pcb + RX pbufs). The 5.2KB
+// server slab eats the arena during a serve, so 1 slot leaves room for the
+// next promotion; more starve the 20KB serve floor.
 #ifndef SSL_PARKED_SLOTS
-#define SSL_PARKED_SLOTS 3
+#define SSL_PARKED_SLOTS 1
 #endif
 
 // Overflow-hold depth: park full (or heap under floor) -> HELD, not RST (same
@@ -138,17 +172,15 @@
 
 // Serve/promote admission, in _accept and _promoteSlot:
 //  - free heap >= PRESSURE_PARK_FLOOR (starvation guard).
-//  - maxblock >= SERVE_BLOCK == slab (ctor's ONE contiguous big alloc).
+//  - maxblock >= SERVE_BLOCK == server slab (ctor's ONE contiguous big alloc).
 // SERVE_BLOCK must stay exactly the slab size: slab+margin (or 9000) deadlocks —
 // it refuses every later conn while maxblock sits under it.
-#ifndef SSL_SERVE_BLOCK
-#define SSL_SERVE_BLOCK SSL_BUFFER_SLAB
-#endif
 
 // Server-side session cache (TLS resumption). Each LRU entry = 100B static;
-// resumption skips the Certificate flight. 2 entries = 200B.
+// resumption skips the Certificate flight. 6 entries = 600B covers Chrome's
+// 6-conn parallelism without LRU thrash.
 #undef SSL_SESSION_CACHE
-#define SSL_SESSION_CACHE 2
+#define SSL_SESSION_CACHE 6
   
 #ifndef SSL_SESSION_CACHE_SIZE
 #define SSL_SESSION_CACHE_SIZE 100
@@ -165,6 +197,10 @@ const int SSL_MAX_FEED_LOOPS = 10;
 // FORWARD DECLARE lwIP types to avoid including lwip/tcp.h in a public header
 struct tcp_pcb;
 struct pbuf;
+
+// Frees queued unconsumed RX pbufs; defined in the .cpp TU where lwIP headers
+// are in scope. Called from ~tcp_ssl_pcb (inline, header-side).
+void tcp_ssl_free_rx_pend(struct tcp_ssl_pcb* ssl_pcb);
 
 // Opaque SSL type — only used as pointer
 struct SSL {};
@@ -224,12 +260,12 @@ struct tcp_ssl_pcb {
 #if ASYNC_TCP_SSL_ENABLE_SERVER
   br_ssl_server_context* sc_server;  // borrowed: &BearSSL_SSL_CTX::server_ctx when is_server (never owned)
 #endif
-  // inbuf/outbuf/accum share ONE slab so the ctor needs a single big hole.
+  // inbuf + outbound ring share ONE slab so the ctor needs a single big hole
+  // (size depends on role; see the alloc functions).
   unsigned char* _slab;       // base of the contiguous buffer allocation
   unsigned char* inbuf;       // _slab + 0
-  unsigned char* outbuf;      // _slab + SSL_IN_BUFFER_SIZE
+  unsigned char* outbuf;      // _slab + role IN buffer size
   size_t inbuf_cap;           // current allocated size of the inbuf region
-  size_t recvrec_accum_cap;   // current allocated size of recvrec_accum region
 
   // pointers to track app data currently in the inbuf and pending in the outbuf
   unsigned char* in_buf_ptr;
@@ -239,10 +275,13 @@ struct tcp_ssl_pcb {
   size_t in_len;
   size_t out_len;
 
-  // The accumulator region lives at _slab + IN + OUT_REGION (see alloc).
-  unsigned char* recvrec_accum;
-  size_t recvrec_accum_len;  // Bytes of data currently in accumulator
-  size_t max_rec_len;        // largest inbound TLS record ciphertext length seen
+  // Direct-stream inbound queue: lwIP recv pbufs wait here (no copy, no ack)
+  // until process_ssl_engine feeds them into the engine's record buffer in
+  // loop() context. tcp_recved() credits only bytes fed -> natural backpressure.
+  struct pbuf* rx_pend[SSL_RX_PEND_MAX];
+  uint8_t  rx_pend_n;         // pbufs currently queued
+  uint16_t rx_pend_head_off;  // bytes already consumed in rx_pend[0]
+  size_t   max_rec_len;       // largest inbound TLS record ciphertext length seen
 
   bool is_server;
   bool handshake_done;
@@ -282,7 +321,8 @@ struct tcp_ssl_pcb {
   struct tcp_ssl_pcb* next;
 
   ~tcp_ssl_pcb() {
-    delete[] _slab;  // inbuf/outbuf/recvrec_accum are offsets into this one block
+    tcp_ssl_free_rx_pend(this);  // return unacked lwIP pbufs before slab dies
+    delete[] _slab;  // inbuf/outbuf are offsets into this one block
 #if ASYNC_TCP_SSL_ENABLE_CLIENT
     delete sc_client;      // safe when null (server role)
     delete insecure_x509;  // owned; safe when null (rootCA path / alloc fail)

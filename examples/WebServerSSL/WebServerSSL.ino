@@ -1,7 +1,7 @@
 /*
  * AsyncTCP - WebServerSSL example
  *
- * ESP32 HTTPS server using AsyncTCP + AsyncTCPTLS directly.
+ * ESP32 HTTPS server using AsyncTCP + AsyncSecureSession directly.
  * Serves a simple page and a JSON API over TLS 1.2 on port 443.
  * Uses a CA-signed cert — the same CA that signs the ClientSSL example's
  * client cert, so either example can verify the other.
@@ -32,7 +32,7 @@
  *   curl -k https://<ESP32_IP>/api
  *
  * Compile with:
- *   compiler.cpp.extra_flags=-DASYNC_TCP_SSL_ENABLED=1
+ *   compiler.cpp.extra_flags=-DASYNC_TCP_SSL_ENABLED=1 -DASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD=1
  */
 
 #ifdef ESP8266

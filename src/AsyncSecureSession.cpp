@@ -132,33 +132,35 @@ tcp_ssl_pcb* tcp_ssl_alloc_pcb(struct tcp_pcb* pcb, bool is_server) {
   ssl_pcb->out_len = 0;
   ssl_pcb->inbuf = nullptr;
   ssl_pcb->outbuf = nullptr;
-  ssl_pcb->recvrec_accum = nullptr;
-  ssl_pcb->_slab = nullptr;
-  ssl_pcb->recvrec_accum_len = 0;
+  ssl_pcb->rx_pend_n = 0;
+  ssl_pcb->rx_pend_head_off = 0;
   ssl_pcb->max_rec_len = 0;
+  ssl_pcb->_slab = nullptr;
 
-  // ONE contiguous allocation for inbuf + record ring + accumulator. A single
-  // ~4.5KB slab needs one big heap hole instead of three separate allocs, so
-  // the admission BLOCK bar can guarantee the whole conn fits in one piece.
-  ssl_pcb->recvrec_accum_cap = SSL_ACCUM_BUFFER_SIZE;
-  ssl_pcb->inbuf_cap = SSL_IN_BUFFER_SIZE;
-  ssl_pcb->_slab = new (std::nothrow) unsigned char[SSL_BUFFER_SLAB];
+  // ONE contiguous allocation for inbuf (+ server record buffer) + outbound
+  // ring. Server sessions need 4096B of record buffer (the OTA uploader is
+  // chunked, so inbound TLS records stay small), so their slab is ~5.2KB;
+  // clients stay compact (~3.2KB). The admission BLOCK bar (SSL_SERVE_BLOCK
+  // == server slab) guarantees the server's ONE big hole exists before serve.
+  const size_t in_sz = is_server ? SSL_SERVER_IN_BUFFER_SIZE : SSL_IN_BUFFER_SIZE;
+  const size_t slab_sz = in_sz + SSL_OUT_BUFFER_REGION;
+  ssl_pcb->inbuf_cap = in_sz;
+  ssl_pcb->_slab = new (std::nothrow) unsigned char[slab_sz];
   if (!ssl_pcb->_slab) {
     async_tcp_log_d("ALLOC FAIL: free heap=%u, need slab=%u (rank=%u)\n",
-                    (unsigned)ESP.getFreeHeap(), (unsigned)SSL_BUFFER_SLAB,
+                    (unsigned)ESP.getFreeHeap(), (unsigned)slab_sz,
                     (unsigned)(is_server ? 2 : 1));
     delete ssl_pcb;
     return nullptr;
   }
   ssl_pcb->inbuf = ssl_pcb->_slab;
-  ssl_pcb->outbuf = ssl_pcb->_slab + SSL_IN_BUFFER_SIZE;
-  ssl_pcb->recvrec_accum = ssl_pcb->_slab + SSL_IN_BUFFER_SIZE + SSL_OUT_BUFFER_REGION;
+  ssl_pcb->outbuf = ssl_pcb->_slab + in_sz;
   for (uint8_t i = 0; i < SSL_RECORD_RING_SLOTS; i++) {
     ssl_pcb->out_ring[i] = ssl_pcb->outbuf + i * SSL_OUT_BUFFER_SIZE;
     ssl_pcb->out_ring_len[i] = 0;
   }
-  async_tcp_log_d("ALLOC: free heap=%u rank=%u slab=%u\n", (unsigned)ESP.getFreeHeap(),
-                  (unsigned)(is_server ? 2 : 1), (unsigned)SSL_BUFFER_SLAB);
+  async_tcp_log_d("ALLOC: free heap=%u rank=%u in=%u slab=%u\n", (unsigned)ESP.getFreeHeap(),
+                  (unsigned)(is_server ? 2 : 1), (unsigned)in_sz, (unsigned)slab_sz);
   return ssl_pcb;
 }
 
@@ -404,54 +406,73 @@ static bool tcp_ssl_pcb_is_alive(tcp_ssl_pcb* ssl_pcb) {
   return false;
 }
 
+// Return queued-but-unconsumed RX pbufs to the lwIP pool. Called from
+// ~tcp_ssl_pcb (loop/lwIP context, safe), so a teardown with pending records
+// never leaks pool RAM or stalls the peer's window forever.
+void tcp_ssl_free_rx_pend(tcp_ssl_pcb* ssl_pcb) {
+  for (uint8_t i = 0; i < ssl_pcb->rx_pend_n; i++) {
+    pbuf_free(ssl_pcb->rx_pend[i]);
+  }
+  ssl_pcb->rx_pend_n = 0;
+  ssl_pcb->rx_pend_head_off = 0;
+}
+
 void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
   if (!ssl_pcb) return;
 
   br_ssl_engine_context* eng;
   eng = tcp_ssl_engine(ssl_pcb);
 
-  // --- Feed accumulated data into BearSSL (runs in loop() context, safe to yield) ---
-  size_t accum_len = ssl_pcb->recvrec_accum_len;
+  // --- Stream pending TLS ciphertext out of the lwIP pbuf queue into
+  // --- BearSSL (runs in loop() context, safe to yield). No fixed accumulator:
+  // --- the ENGINE's record buffer sizes each record, so records larger than
+  // --- the 4096B server inbuf (e.g. a 16KB un-chunked browser record) get
+  // --- BR_ERR_TOO_LARGE — the OTA uploader is chunked to keep records small.
+  // --- tcp_recved() credits only bytes actually fed here, so the peer's
+  // --- window closes when the engine stalls and opens as we consume.
+  while (ssl_pcb->rx_pend_n > 0) {
+    struct pbuf* head = ssl_pcb->rx_pend[0];
+    size_t head_len = head->tot_len;
+    size_t consumed = ssl_pcb->rx_pend_head_off;
 
-  if (accum_len > 0) {
-    // MEASUREMENT: report the largest inbound TLS record ciphertext length.
-    // Peek header bytes 3-4 (big-endian length) of the first pending record,
-    // but ONLY at a fresh record-start boundary (ixa==ixb==0) to avoid
-    // mis-reading mid-record. Log only on a new max to reduce noise.
-    if (accum_len >= 5 && eng->ixa == 0 && eng->ixb == 0) {
-      size_t rlen = ((size_t)ssl_pcb->recvrec_accum[3] << 8) | ssl_pcb->recvrec_accum[4];
-      if (rlen > ssl_pcb->max_rec_len) {
-        ssl_pcb->max_rec_len = rlen;
-        async_tcp_log_i("INREC: len=%u (ciphertext bytes for first pending record), "
-                        "free heap=%u, accum=%u, mfln=%d\n",
-                        (unsigned)rlen, (unsigned)ESP.getFreeHeap(), (unsigned)accum_len,
-                        (int)br_ssl_engine_get_mfln_negotiated(eng));
+    // MEASUREMENT: report the largest inbound TLS record ciphertext length,
+    // peeking the record header (bytes 3-4 big-endian) only at a fresh record
+    // boundary (ixa==ixb==0) to avoid mis-reading mid-record.
+    if (consumed == 0 && eng->ixa == 0 && eng->ixb == 0 && head_len >= 5) {
+      unsigned char hdr[5];
+      if (pbuf_copy_partial(head, hdr, 5, 0) == 5) {
+        size_t rlen = ((size_t)hdr[3] << 8) | hdr[4];
+        if (rlen > ssl_pcb->max_rec_len) {
+          ssl_pcb->max_rec_len = rlen;
+          async_tcp_log_i("INREC: len=%u (ciphertext bytes for first pending record), "
+                          "free heap=%u, pend=%u, mfln=%d\n",
+                          (unsigned)rlen, (unsigned)ESP.getFreeHeap(),
+                          (unsigned)ssl_pcb->rx_pend_n,
+                          (int)br_ssl_engine_get_mfln_negotiated(eng));
+        }
       }
     }
 
-    size_t consumed = 0;
+    size_t available;
+    unsigned char* buf = br_ssl_engine_recvrec_buf(eng, &available);
+    if (available == 0) break;
 
-    while (consumed < accum_len) {
-      size_t available;
-      unsigned char* buf = br_ssl_engine_recvrec_buf(eng, &available);
+    size_t to_feed = head_len - consumed;
+    if (to_feed > available) to_feed = available;
 
-      if (available == 0) break;
+    pbuf_copy_partial(head, buf, to_feed, consumed);
+    br_ssl_engine_recvrec_ack(eng, to_feed);
+    ssl_pcb->rx_pend_head_off = (uint16_t)(consumed + to_feed);
 
-      size_t to_feed = (accum_len - consumed < available) ?
-                       (accum_len - consumed) : available;
-
-      memcpy(buf, ssl_pcb->recvrec_accum + consumed, to_feed);
-      br_ssl_engine_recvrec_ack(eng, to_feed);
-      consumed += to_feed;
-    }
-
-    // Shift remaining un-consumed data to beginning
-    if (consumed < accum_len) {
-      size_t left = accum_len - consumed;
-      memmove(ssl_pcb->recvrec_accum, ssl_pcb->recvrec_accum + consumed, left);
-      ssl_pcb->recvrec_accum_len = left;
-    } else {
-      ssl_pcb->recvrec_accum_len = 0;
+    if (ssl_pcb->rx_pend_head_off >= head_len) {
+      tcp_recved(ssl_pcb->tcp, head_len);
+      pbuf_free(head);
+      ssl_pcb->rx_pend_n--;
+      if (ssl_pcb->rx_pend_n > 0) {
+        memmove(&ssl_pcb->rx_pend[0], &ssl_pcb->rx_pend[1],
+                ssl_pcb->rx_pend_n * sizeof(ssl_pcb->rx_pend[0]));
+      }
+      ssl_pcb->rx_pend_head_off = 0;
     }
   }
 
@@ -477,9 +498,9 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
       // usually a resume-path failure (bad_record_mac/decrypt_error on the
       // abbreviated handshake). Log the decoded alert loudly.
       if (!ssl_pcb->handshake_done && ssl_pcb->is_server) {
-        async_tcp_log_e("PSE: server handshake FAILED err=%d (%s), free heap=%u, accum=%u\n",
+        async_tcp_log_e("PSE: server handshake FAILED err=%d (%s), free heap=%u, pend=%u\n",
                         err, tcp_ssl_error_string(err), (unsigned)ESP.getFreeHeap(),
-                        (unsigned)ssl_pcb->recvrec_accum_len);
+                        (unsigned)ssl_pcb->rx_pend_n);
       }
       // Re-check liveness: the engine may have been torn down (scheduled error
       // callback or app close) during a yield(). Firing on_error on a freed
@@ -510,7 +531,7 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
 
     if (state & BR_SSL_RECVAPP) {
       ssl_pcb->in_buf_ptr = br_ssl_engine_recvapp_buf(eng, &(ssl_pcb->in_len));
-      if (ssl_pcb->in_len && ssl_pcb->in_len < SSL_IN_BUFFER_SIZE) {
+      if (ssl_pcb->in_len && ssl_pcb->in_len < ssl_pcb->inbuf_cap) {
         br_ssl_engine_recvapp_ack(eng, ssl_pcb->in_len);
         if (ssl_pcb->on_data) {
           ssl_pcb->on_data(ssl_pcb->arg, ssl_pcb->tcp, ssl_pcb->in_buf_ptr, ssl_pcb->in_len);
@@ -765,37 +786,21 @@ int tcp_ssl_read(struct tcp_pcb* pcb, struct pbuf* pb) {
     return -1;
   }
 
-  // ---- Accumulate data from lwIP callback into recvrec_accum ----
-  // NO BearSSL calls here — we're in lwIP context (no yield allowed).
-  // All BearSSL feeding happens in process_ssl_engine (loop() context).
-  size_t remaining = pb->tot_len;
-  size_t pb_offset = 0;
-
-  while (remaining > 0) {
-    size_t accum_space = SSL_ACCUM_BUFFER_SIZE - ssl_pcb->recvrec_accum_len;
-    if (accum_space == 0) {
-      // Accumulator full — schedule engine to drain, then retry
-      schedule_ssl_engine(ssl_pcb);
-      // In lwIP context we can't wait — just drop what doesn't fit
-      break;
-    }
-
-    size_t to_copy = (remaining < accum_space) ? remaining : accum_space;
-    pbuf_copy_partial(pb, ssl_pcb->recvrec_accum + ssl_pcb->recvrec_accum_len,
-                      to_copy, pb_offset);
-    ssl_pcb->recvrec_accum_len += to_copy;
-    pb_offset += to_copy;
-    remaining -= to_copy;
-  }
-
-  if (remaining > 0) {
-    // Overflow — some data couldn't be buffered
+  // ---- Queue the pbuf, do NOT copy/ack/free here ----
+  // NO BearSSL calls in lwIP context (no yield allowed); process_ssl_engine
+  // (loop() context) feeds the pbuf chain into the engine's record buffer and
+  // tcp_recved()s only consumed bytes. Holding the pbuf un-acked backpressures
+  // the peer via the TCP window, so small (chunked) records stream without a
+  // fixed-size staging copy; records larger than the server inbuf
+  // (BR_ERR_TOO_LARGE) are avoided by the chunked OTA uploader.
+  if (ssl_pcb->rx_pend_n >= SSL_RX_PEND_MAX) {
+    // Should not happen: credit-only consumption bounds the in-flight queue.
+    async_tcp_log_d("RX PEND FULL: n=%u, dropping conn\n", (unsigned)ssl_pcb->rx_pend_n);
     pbuf_free(pb);
     return -1;
   }
 
-  tcp_recved(pcb, pb->tot_len);
-  pbuf_free(pb);
+  ssl_pcb->rx_pend[ssl_pcb->rx_pend_n++] = pb;  // take ownership
 
   // Schedule BearSSL processing in loop() context
   schedule_ssl_engine(ssl_pcb);
@@ -1052,7 +1057,7 @@ int tcp_ssl_new_client(struct tcp_pcb* pcb, const char* host, const br_x509_clas
 
   br_ssl_engine_set_x509(&ssl_pcb->sc_client->eng, x509ctx);
 
-  br_ssl_engine_set_buffers_bidi(&ssl_pcb->sc_client->eng, ssl_pcb->inbuf, SSL_IN_BUFFER_SIZE,
+  br_ssl_engine_set_buffers_bidi(&ssl_pcb->sc_client->eng, ssl_pcb->inbuf, ssl_pcb->inbuf_cap,
                                  ssl_pcb->outbuf, SSL_OUT_BUFFER_SIZE);
   br_ssl_engine_set_versions(&ssl_pcb->sc_client->eng, BR_TLS12, BR_TLS12);
 
@@ -1091,10 +1096,26 @@ int tcp_ssl_new_client(struct tcp_pcb* pcb, const char* host, const br_x509_clas
 
 #include "AsyncTCPLogging.h"
 
+// Encrypted-private-key password support (OpenSSL PKCS#8/PBES2 decrypt). Set to
+// 1 to enable the PBKDF2/AES-CBC decrypt path in tcp_ssl_new_server_ctx and the
+// PROGMEM password copy; leave 0 (default) to save flash/RAM and only support
+// unencrypted `BEGIN PRIVATE KEY`/`BEGIN RSA/EC PRIVATE KEY` keys. Examples that
+// demo encrypted keys (WebServerSSL, ClientSSL) define it to 1 in their compile
+// flags. Server builds with the password compiled out simply ignore the
+// password argument.
+#ifndef ASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD
+#define ASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD 0
+#endif
+
 #include <ESP8266WiFi.h>  // core built-in <BearSSLHelpers.h> -> BearSSL::PrivateKey
 #include <StackThunk.h>
 #include <string.h>  // strlen_P/memcpy_P (PROGMEM patch; <string.h> pulls <sys/string.h>)
 #include <bearssl/bearssl_pem.h>
+#if ASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD
+#include <bearssl/bearssl_block.h>
+#include <bearssl/bearssl_hmac.h>
+#include <bearssl/bearssl_hash.h>
+#endif
 #include <lwip/tcp.h>
 #include <Schedule.h>  // schedule_function()
 
@@ -1126,10 +1147,381 @@ static std::unique_ptr<char[]> normalize_pem(const char* src, const char*& out) 
   return buf;
 }
 
+// --- Encrypted private key (PKCS#8 / PBES2) support -------------------------
+#if ASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD
+// BearSSL's br_skey_decoder only parses *unencrypted* private keys, so the
+// server-side password of beginSecure(cert, key, password) used to be ignored
+// on ESP8266 (the TLS glue just did `(void)password`). OpenSSL's
+// "ENCRYPTED PRIVATE KEY" PEM is a PKCS#8 EncryptedPrivateKeyInfo (RFC 5958)
+// wrapped in PBES2 (RFC 8018). Decrypt it here with BearSSL's own primitives
+// (PBKDF2-HMAC over SHA1/SHA256 + AES-CBC or DES-EDE3-CBC), then hand the
+// plaintext PKCS#8 DER to the usual BearSSL::PrivateKey DER parser.
+// Envelope scope (modern OpenSSL default only): PBKDF2 with hmacWithSHA256 PRF
+// + aes-256-cbc. Older/weaker parameter sets (hmacSHA1 PRF, aes-128/192-cbc,
+// des-ede3-cbc, PBES1, scrypt, AES-GCM, ...) fail with a log line — no legacy
+// path is kept.
+
+// Minimal DER TLV reader. No multi-byte (0x1f) tags and no indefinite (0x80)
+// lengths are produced by this envelope. brssl_der_take() consumes one element
+// and advances the reader past its value.
+struct BrsslDer {
+  const uint8_t* p;
+  size_t n;
+};
+
+static bool brssl_der_take(BrsslDer* d, unsigned* tag, const uint8_t** val, size_t* vlen) {
+  if (!d || d->n < 2) return false;
+  unsigned t = d->p[0];
+  if (t == 0x1f) return false;              // high-tag-number form unsupported
+  size_t l = d->p[1];
+  size_t off = 2;
+  if (l & 0x80) {                           // long-form length
+    size_t nb = l & 0x7f;
+    if (nb == 0 || nb > 4 || d->n < off + nb) return false;
+    l = 0;
+    for (size_t i = 0; i < nb; i++) l = (l << 8) | d->p[off + i];
+    off += nb;
+  }
+  if (l > d->n - off) return false;
+  if (tag) *tag = t;
+  if (val) *val = d->p + off;
+  if (vlen) *vlen = l;
+  d->p += off + l;
+  d->n -= off + l;
+  return true;
+}
+
+// Look at the tag of the next element without consuming it (0 if empty).
+static unsigned brssl_der_peek_tag(const BrsslDer* d) {
+  if (!d || d->n == 0) return 0;
+  return d->p[0];
+}
+
+static bool brssl_oid_match(const uint8_t* val, size_t vlen, const uint8_t* oid, size_t oidlen) {
+  return vlen == oidlen && memcmp(val, oid, oidlen) == 0;
+}
+
+// ASN.1 OBJECT IDENTIFIER encodings for the supported envelope.
+static const uint8_t OID_PBES2[]         = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x05,0x0d};
+static const uint8_t OID_PBKDF2[]        = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x01,0x05,0x0c};
+static const uint8_t OID_HMAC_SHA256[]   = {0x2a,0x86,0x48,0x86,0xf7,0x0d,0x02,0x09};
+static const uint8_t OID_AES256_CBC[]    = {0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x01,0x2a};
+
+// PBKDF2 (RFC 8018 section 5.2) built on BearSSL's HMAC context. PRF is fixed
+// to hmacWithSHA256 (SHA-256, 32-byte digest).
+static bool brssl_pbkdf2(const uint8_t* pass, size_t passlen,
+                         const uint8_t* salt, size_t saltlen, uint32_t iters,
+                         uint8_t* out, size_t outlen) {
+  if (iters == 0) return false;
+  const size_t hlen = 32;                  // SHA-256 (hmacWithSHA256 PRF)
+  br_hmac_key_context kc;
+  br_hmac_key_init(&kc, &br_sha256_vtable, pass, passlen);
+  uint8_t u[64], t[64];
+  size_t o = 0;
+  for (uint32_t idx = 1; o < outlen; idx++) {
+    uint8_t ib[4] = {(uint8_t)(idx >> 24), (uint8_t)(idx >> 16), (uint8_t)(idx >> 8), (uint8_t)idx};
+    br_hmac_context hc;
+    br_hmac_init(&hc, &kc, 0);
+    br_hmac_update(&hc, salt, saltlen);
+    br_hmac_update(&hc, ib, 4);
+    br_hmac_out(&hc, u);
+    memcpy(t, u, hlen);
+    for (uint32_t i = 1; i < iters; i++) {
+      br_hmac_init(&hc, &kc, 0);
+      br_hmac_update(&hc, u, hlen);
+      br_hmac_out(&hc, u);
+      for (size_t k = 0; k < hlen; k++) t[k] ^= u[k];
+    }
+    size_t take = hlen;
+    if (take > outlen - o) take = outlen - o;
+    memcpy(out + o, t, take);
+    o += take;
+  }
+  return true;
+}
+
+// CBC decryption via BearSSL's AES (in place). aes-256-cbc only: 32-byte key,
+// 16-byte blocks, iv passed in and updated.
+static bool brssl_cbc_decrypt(const uint8_t* key, const uint8_t* ivin,
+                              uint8_t* data, size_t len) {
+  if (len == 0 || (len % 16) != 0) return false;
+  uint8_t iv[16];
+  memcpy(iv, ivin, 16);
+  br_aes_small_cbcdec_keys aks;
+  br_aes_small_cbcdec_init(&aks, key, 32);
+  br_aes_small_cbcdec_run(&aks, iv, data, len);
+  return true;
+}
+
+// Strip PKCS#7 block padding. Returns the unpadded length (0 if invalid).
+static size_t brssl_strip_pkcs7(uint8_t* data, size_t len, size_t blocksize) {
+  if (len == 0 || (len % blocksize) != 0) return 0;
+  size_t pad = data[len - 1];
+  if (pad == 0 || pad > blocksize || pad > len) return 0;
+  for (size_t i = 1; i <= pad; i++) {
+    if (data[len - i] != (uint8_t)pad) return 0;
+  }
+  return len - pad;
+}
+
+// Walk a PEM blob and return the DER body of the first object named `label`
+// ("ENCRYPTED PRIVATE KEY"). Mirrors the event loop of parse_certificates().
+// The result is malloc'd and owned by the caller (free() after use).
+struct BrsslPemBuf {
+  unsigned char* buf;
+  size_t len;
+  bool error;
+};
+
+static void brssl_pem_append(void* ctxp, const void* data, size_t len) {
+  BrsslPemBuf* b = (BrsslPemBuf*)ctxp;
+  if (b->error) return;
+  unsigned char* nb = (unsigned char*)realloc(b->buf, b->len + len);
+  if (!nb) {
+    b->error = true;
+    free(b->buf);
+    b->buf = nullptr;
+    return;
+  }
+  b->buf = nb;
+  memcpy(b->buf + b->len, data, len);
+  b->len += len;
+}
+
+static bool brssl_pem_extract_object(const char* pem, const char* label,
+                                     unsigned char** out, size_t* outlen) {
+  if (!pem || !label || !out || !outlen) return false;
+  br_pem_decoder_context pc;
+  br_pem_decoder_init(&pc);
+  BrsslPemBuf b;
+  b.buf = nullptr;
+  b.len = 0;
+  b.error = false;
+  br_pem_decoder_setdest(&pc, brssl_pem_append, &b);
+
+  size_t len = strlen(pem);
+  size_t pushed = 0;
+  bool in_obj = false;
+  for (;;) {
+    bool made_progress = false;
+    size_t r = br_pem_decoder_push(&pc, (const unsigned char*)pem + pushed, len - pushed);
+    pushed += r;
+    if (r > 0) made_progress = true;
+    for (;;) {
+      if (b.error) {
+        free(b.buf);
+        return false;
+      }
+      int event = br_pem_decoder_event(&pc);
+      if (event == BR_PEM_BEGIN_OBJ) {
+        in_obj = (strcmp(br_pem_decoder_name(&pc), label) == 0);
+        free(b.buf);          // (re)start accumulation for this object only
+        b.buf = nullptr;
+        b.len = 0;
+        made_progress = true;
+      } else if (event == BR_PEM_END_OBJ) {
+        if (in_obj && b.buf && b.len > 0) {
+          *out = b.buf;       // caller owns
+          *outlen = b.len;
+          return true;
+        }
+        free(b.buf);
+        b.buf = nullptr;
+        b.len = 0;
+        in_obj = false;
+        made_progress = true;
+      } else {
+        break;
+      }
+    }
+    if (pushed >= len) break;
+    if (!made_progress) break;
+  }
+  // One-shot feed may skip the final END_OBJ: finalize a pending match.
+  if (in_obj && b.buf && b.len > 0) {
+    *out = b.buf;
+    *outlen = b.len;
+    return true;
+  }
+  free(b.buf);
+  return false;
+}
+
+// Decrypt a PKCS#8 EncryptedPrivateKeyInfo (DER) into a plaintext PKCS#8 DER
+// private key. `err` receives a static reason string on failure.
+static bool brssl_pbes2_decrypt(const uint8_t* der, size_t dern,
+                                const char* password,
+                                unsigned char** out, size_t* outlen,
+                                const char** err) {
+  if (err) *err = nullptr;
+  if (!der || !password || !out || !outlen) {
+    if (err) *err = "bad args";
+    return false;
+  }
+  size_t pwlen = strlen(password);
+  if (pwlen == 0) {
+    if (err) *err = "empty password";
+    return false;
+  }
+
+  BrsslDer top{der, dern};
+  unsigned tag;
+  const uint8_t* v;
+  size_t vl;
+  if (!brssl_der_take(&top, &tag, &v, &vl) || tag != 0x30) {
+    if (err) *err = "not a SEQUENCE";
+    return false;
+  }
+  BrsslDer emain{v, vl};                               // algId + encryptedData
+  if (!brssl_der_take(&emain, &tag, &v, &vl) || tag != 0x30) {
+    if (err) *err = "missing algorithm seq";
+    return false;
+  }
+  BrsslDer alg{v, vl};
+  if (!brssl_der_take(&alg, &tag, &v, &vl) || tag != 0x06) {
+    if (err) *err = "missing algorithm OID";
+    return false;
+  }
+  if (!brssl_oid_match(v, vl, OID_PBES2, sizeof OID_PBES2)) {
+    if (err) *err = "unsupported algorithm (only PBES2)";
+    return false;
+  }
+  if (!brssl_der_take(&alg, &tag, &v, &vl) || tag != 0x30) {
+    if (err) *err = "missing PBES2 params";
+    return false;
+  }
+  BrsslDer params{v, vl};
+
+  // keyDerivationFunc: AlgorithmIdentifier -> PBKDF2
+  if (!brssl_der_take(&params, &tag, &v, &vl) || tag != 0x30) {
+    if (err) *err = "missing kdf seq";
+    return false;
+  }
+  BrsslDer kdf{v, vl};
+  if (!brssl_der_take(&kdf, &tag, &v, &vl) || tag != 0x06 ||
+      !brssl_oid_match(v, vl, OID_PBKDF2, sizeof OID_PBKDF2)) {
+    if (err) *err = "unsupported kdf (only PBKDF2)";
+    return false;
+  }
+  const uint8_t* salt = nullptr;
+  size_t saltlen = 0;
+  uint32_t iters = 0;
+  if (brssl_der_peek_tag(&kdf) == 0x30) {              // PBKDF2-params (present)
+    if (!brssl_der_take(&kdf, &tag, &v, &vl) || tag != 0x30) {
+      if (err) *err = "bad PBKDF2 params";
+      return false;
+    }
+    BrsslDer kp{v, vl};
+    if (!brssl_der_take(&kp, &tag, &v, &vl) || tag != 0x04) {
+      if (err) *err = "bad salt";
+      return false;
+    }
+    salt = v;
+    saltlen = vl;
+    if (!brssl_der_take(&kp, &tag, &v, &vl) || tag != 0x02 || vl == 0 || vl > 4) {
+      if (err) *err = "bad iteration count";
+      return false;
+    }
+    iters = 0;
+    for (size_t i = 0; i < vl; i++) iters = (iters << 8) | v[i];
+    if (brssl_der_peek_tag(&kp) == 0x02) {             // optional key length
+      if (!brssl_der_take(&kp, &tag, &v, &vl) || tag != 0x02) {
+        if (err) *err = "bad key length";
+        return false;
+      }
+    }
+    if (brssl_der_peek_tag(&kp) == 0x30) {             // PRF (required, SHA-256 only)
+      if (!brssl_der_take(&kp, &tag, &v, &vl) || tag != 0x30) {
+        if (err) *err = "bad PRF seq";
+        return false;
+      }
+      BrsslDer prf{v, vl};
+      if (!brssl_der_take(&prf, &tag, &v, &vl) || tag != 0x06 ||
+          !brssl_oid_match(v, vl, OID_HMAC_SHA256, sizeof OID_HMAC_SHA256)) {
+        if (err) *err = "unsupported PRF (only hmacSHA256)";
+        return false;
+      }
+    } else {
+      // PRF omitted == RFC default hmacWithSHA1 -> unsupported.
+      if (err) *err = "unsupported PRF (only hmacSHA256)";
+      return false;
+    }
+  } else {
+    // PBKDF2-params omitted: nothing to derive from.
+    if (err) *err = "PBKDF2 params omitted";
+    return false;
+  }
+
+  // encryptionScheme: AlgorithmIdentifier -> cipher + IV
+  if (!brssl_der_take(&params, &tag, &v, &vl) || tag != 0x30) {
+    if (err) *err = "missing cipher seq";
+    return false;
+  }
+  BrsslDer enc{v, vl};
+  if (!brssl_der_take(&enc, &tag, &v, &vl) || tag != 0x06) {
+    if (err) *err = "missing cipher OID";
+    return false;
+  }
+  bool is_aes256 = brssl_oid_match(v, vl, OID_AES256_CBC, sizeof OID_AES256_CBC);
+  if (!is_aes256) {
+    if (err) *err = "unsupported cipher (only aes-256-cbc)";
+    return false;
+  }
+  const size_t dklen = 32;
+  const uint8_t* iv = nullptr;
+  size_t ivlen = 0;
+  if (!brssl_der_take(&enc, &tag, &v, &vl) || tag != 0x04) {
+    if (err) *err = "missing IV";
+    return false;
+  }
+  iv = v;
+  ivlen = vl;
+  const size_t need_iv = 16;
+  if (ivlen != need_iv) {
+    if (err) *err = "IV length mismatch";
+    return false;
+  }
+
+  if (!brssl_der_take(&emain, &tag, &v, &vl) || tag != 0x04) {
+    if (err) *err = "missing encryptedData";
+    return false;
+  }
+  const uint8_t* ct = v;
+  size_t ctlen = vl;
+
+  uint8_t dk[32];
+  if (!brssl_pbkdf2((const uint8_t*)password, pwlen, salt, saltlen, iters, dk, dklen)) {
+    if (err) *err = "PBKDF2 failed";
+    return false;
+  }
+  unsigned char* plain = (unsigned char*)malloc(ctlen);
+  if (!plain) {
+    if (err) *err = "OOM";
+    return false;
+  }
+  memcpy(plain, ct, ctlen);
+  if (!brssl_cbc_decrypt(dk, iv, plain, ctlen)) {
+    free(plain);
+    if (err) *err = "CBC decrypt failed";
+    return false;
+  }
+  size_t plainlen = brssl_strip_pkcs7(plain, ctlen, 16);
+  if (plainlen == 0) {
+    free(plain);
+    if (err) *err = "bad padding (wrong password?)";
+    return false;
+  }
+  *out = plain;
+  *outlen = plainlen;
+  return true;
+}
+
+#endif  // ASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD
+
 BearSSL_SSL_CTX* tcp_ssl_new_server_ctx(const char* cert_pem, const char* private_key_pem,
                                 const char* password) {
-  (void)password;
-  async_tcp_log_i("[CTX] cert=%p key=%p (flash if >=0x40200000)\n", (const void*)cert_pem, (const void*)private_key_pem);
+  async_tcp_log_i("[CTX] cert=%p key=%p (flash if >=0x40200000)\n",
+                  (const void*)cert_pem, (const void*)private_key_pem);
   if (!cert_pem || !private_key_pem) {
     async_tcp_log_e("[CTX] null PEM ptr -> fail\n");
     return nullptr;
@@ -1162,6 +1554,29 @@ BearSSL_SSL_CTX* tcp_ssl_new_server_ctx(const char* cert_pem, const char* privat
     return nullptr;
   }
 
+  // Password may be a PROGMEM (F("...")) literal, like the PEMs above; copy it
+  // to RAM so strlen/memcpy always work. Only needed for encrypted-key decrypt;
+  // compiled out (with (void)password) when the feature is disabled.
+#if ASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD
+  std::unique_ptr<char[]> pw_ram_buf;
+  if (password) {
+    bool pw_flash = ((uint32_t)(const void*)password) >= 0x40200000;
+    size_t pwlen = pw_flash ? strlen_P(password) : strlen(password);
+    pw_ram_buf = std::unique_ptr<char[]>(new (std::nothrow) char[pwlen + 1]);
+    if (!pw_ram_buf) {
+      async_tcp_log_e("[CTX] password copy OOM -> fail\n");
+      delete ctx;
+      return nullptr;
+    }
+    if (pw_flash) memcpy_P(pw_ram_buf.get(), password, pwlen);
+    else          memcpy(pw_ram_buf.get(), password, pwlen);
+    pw_ram_buf[pwlen] = '\0';
+    password = pw_ram_buf.get();
+  }
+#else
+  (void)password;
+#endif
+
   size_t ncerts = parse_certificates(cert_pem, ctx->chain_vector);
   async_tcp_log_i("[CTX] parse_certificates returned %u certs\n", (unsigned)ncerts);
   if (ncerts == 0) {
@@ -1169,7 +1584,42 @@ BearSSL_SSL_CTX* tcp_ssl_new_server_ctx(const char* cert_pem, const char* privat
     return nullptr;
   }
 
-  ctx->pk = new (std::nothrow) BearSSL::PrivateKey(private_key_pem);
+  // BearSSL's key parser needs unencrypted PKCS#8; if OpenSSL-style
+  // "ENCRYPTED PRIVATE KEY" was supplied, decrypt it (PBES2) then hand the
+  // plaintext DER to the same parser. PrivateKey(DER,len) copies its input, so
+  // the decrypt buffers are freed right after construction. When password
+  // support is compiled out, only the plain unencrypted path exists.
+#if ASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD
+  if (strstr(private_key_pem, "ENCRYPTED PRIVATE KEY") != nullptr) {
+    if (!password || !password[0]) {
+      async_tcp_log_e("[CTX] key is encrypted but no password given -> fail\n");
+      delete ctx;
+      return nullptr;
+    }
+    unsigned char* der = nullptr;
+    size_t derlen = 0;
+    if (!brssl_pem_extract_object(private_key_pem, "ENCRYPTED PRIVATE KEY", &der, &derlen)) {
+      async_tcp_log_e("[CTX] no ENCRYPTED PRIVATE KEY object found -> fail\n");
+      delete ctx;
+      return nullptr;
+    }
+    unsigned char* plain = nullptr;
+    size_t plainlen = 0;
+    const char* err = nullptr;
+    if (!brssl_pbes2_decrypt(der, derlen, password, &plain, &plainlen, &err)) {
+      async_tcp_log_e("[CTX] key decrypt failed: %s -> fail\n", err ? err : "?");
+      free(der);
+      delete ctx;
+      return nullptr;
+    }
+    free(der);
+    ctx->pk = new (std::nothrow) BearSSL::PrivateKey(plain, plainlen);
+    free(plain);
+  } else
+#endif  // ASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD
+  {
+    ctx->pk = new (std::nothrow) BearSSL::PrivateKey(private_key_pem);
+  }
   if (!ctx->pk) {
     async_tcp_log_e("[CTX] PrivateKey alloc OOM -> fail\n");
     delete ctx;
@@ -1252,20 +1702,13 @@ int tcp_ssl_new_server(struct tcp_pcb* pcb, BearSSL_SSL_CTX* ssl_ctx) {
   // No heap allocated here, so "TLS init failed" churn can't happen.
   ssl_pcb->sc_server = &ssl_ctx->server_ctx;
 
-  br_ssl_engine_set_buffers_bidi(&ssl_pcb->sc_server->eng, ssl_pcb->inbuf, SSL_IN_BUFFER_SIZE,
+  br_ssl_engine_set_buffers_bidi(&ssl_pcb->sc_server->eng, ssl_pcb->inbuf, ssl_pcb->inbuf_cap,
                                  ssl_pcb->outbuf, SSL_OUT_BUFFER_SIZE);
 
   if (!br_ssl_server_reset(ssl_pcb->sc_server)) {
     delete ssl_pcb;
     return -1;
   }
-
-  // Force MFLN (RFC 6066 max_fragment_length) = 1024 on the server.
-  // br_ssl_engine_new_max_frag_len() caps every outbound record's plaintext
-  // (incl. the handshake Certificate flight) at 1024 bytes.
-#if SSL_SERVER_MFLN && SSL_SERVER_MFLN != 0
-  br_ssl_engine_new_max_frag_len(&ssl_pcb->sc_server->eng, SSL_SERVER_MFLN);
-#endif
 
   tcp_ssl_register_pcb(ssl_pcb);
   return 0;

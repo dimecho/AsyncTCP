@@ -1516,9 +1516,9 @@ void AsyncClient::_ssl_error(int8_t err) {
     _error_cb(_error_cb_arg, this, err + 64);
   // The BearSSL engine reached CLOSED (peer close_notify, TLS alert, or engine
   // error) without an app-initiated _close(). process_ssl_engine() routes this
-  // here via on_error. If we don't tear down now, the tcp_ssl_pcb (in+out+
-  // accum buffers ~6KB) leaks. _close() frees it (guarded by find_ssl_pcb
-  // returning -1 for already-freed pcbs).
+  // here via on_error. If we don't tear down now, the tcp_ssl_pcb (in+out slab
+  // ~5.2KB server / ~3.2KB client, + queued pbufs) leaks. _close() frees it
+  // (guarded by find_ssl_pcb returning -1 for already-freed pcbs).
   close();
 }
 
@@ -1665,23 +1665,27 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
     return ERR_OK;
   }
 #if ASYNC_TCP_SSL_ENABLED
-  // SSL Handshake Timeout — 6s; the admission gates (free >= 9K, maxblock >=
+  // SSL Handshake Timeout — 12s. The admission gates (free >= 9K, maxblock >=
   // slab) mean the flight usually fits, but a momentary fragmented dip can
-  // defer the record for a while. A stuck half-open handshake holds ~5.4KB of
-  // TLS buffers, so
+  // defer the record for a while. The K=1 out-ring puts exactly one TLS record
+  // in flight (no pipeline), so a single lost packet costs a full TCP RTO
+  // backoff (1s, 2s, 4s, 8s...) before the peer re-sends — 6s cuts healthy
+  // handshakes off mid-retransmit on a lossy 2.4GHz link. A stuck half-open
+  // handshake holds ~5.4KB of TLS buffers, so
   // still bound it.
-  if (_pcb_secure && !_handshake_done && (now - _rx_last_packet) >= 6000) {
+  if (_pcb_secure && !_handshake_done && (now - _rx_last_packet) >= 12000) {
     async_tcp_log_d("SSL handshake timeout %d", pcb->state);
     _close();
     return ERR_OK;
   }
 
-  // Deferred-record retry. A SENDREC record that couldn't be written is retried
-  // on the next ACK (_sent). But when it is the LAST outstanding record there is
-  // no future ACK to wake it. lwIP polls this callback every TCP_POLL_INTERVAL
-  // regardless of traffic, so re-arm the engine here too; tcp_ssl_sent() is
-  // idempotent (no-op unless sendrec_deferred is set and engine is in SENDREC).
-  if (_pcb_secure && _handshake_done) {
+  // Deferred-record retry + SENDREC stall recovery, BOTH handshake and body
+  // phases. A handshake flight (ServerHello+cert) deferred on pbuf/heap
+  // pressure is the same wedge as a body record: nothing on the wire -> no ACK
+  // to wake it, so the poll must re-arm. tcp_ssl_sent() is idempotent (no-op
+  // unless the engine is actually in BR_SSL_SENDREC with a deferred record),
+  // so calling it on an idle or mid-RX conn is harmless.
+  if (_pcb_secure) {
     tcp_ssl_sent(pcb, 0);  // poll retry: no ACK to account for, just re-arm
     // Bounded hard-stall recovery. A SENDREC record that tcp_write() cannot
     // transmit even with an open send window and an empty pbuf queue has
@@ -1694,6 +1698,8 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
       _close();
       return ERR_OK;
     }
+  }
+  if (_pcb_secure && _handshake_done) {
     // Silent-live teardown (browser stop/abort recovery). A force-"stop" in the
     // browser usually abandons the socket (RST) or simply stops reading; it
     // does not always deliver the FIN that _recv()'s pb==NULL path closes on.
@@ -2347,16 +2353,16 @@ int8_t AsyncServer::_accept(tcp_pcb *pcb, int8_t err) {
     // (PARKED_SLOTS) + overflow hold queue (HOLD_LIMIT). While a conn is
     // active, extra conns are queued as raw pcbs (NO SSL buffers yet) and
     // promoted FIFO the moment the slot frees and heap clears the bar (free >=
-    // 9K && maxblock >= slab size), so a conn never ctors into a churned arena
-    // mid-close. Queue slots are shed after SSL_QUEUE_IDLE_MS if
+    // 9K && maxblock >= server slab ~5.2KB), so a conn never ctors into a
+    // churned arena mid-close. Queue slots are shed after SSL_QUEUE_IDLE_MS if
     // never promoted.
     if (tcp_ssl_client_count() >= SSL_MAX_CONNECTIONS) {
       // Pressure-aware parking: while the live conn is serving, prefer the
       // staged park queue only when free heap >= floor (a staged slot pins
-      // ~5.2KB of pbuf/ClientHello that a struggling live conn may need for its
-      // next record). Under the floor, or when the park queue is full, the
-      // conn falls to the overflow-hold tier instead of being RST'd — same
-      // pool-only buffering, no heap, bounded by HOLD_LIMIT.
+      // ~4KB of pbuf/ClientHello that a struggling live conn's 5.2KB serve
+      // may need for its next record). Under the floor, or when the park queue
+      // is full, the conn falls to the overflow-hold tier instead of being
+      // RST'd — same pool-only buffering, no heap, bounded by HOLD_LIMIT.
       struct pending_pcb *new_item = NULL;
       if (s_async_parked_tls < SSL_PARKED_SLOTS &&
           (unsigned)ESP.getFreeHeap() >= SSL_PRESSURE_PARK_FLOOR) {
@@ -2389,8 +2395,11 @@ int8_t AsyncServer::_accept(tcp_pcb *pcb, int8_t err) {
       // Wedged-staged or park full -> overflow-held tier: same buffering as a
       // park slot (pool pbufs only; no heap beyond the 24B pending_pcb) but
       // admitted even when free heap < floor, so a tight arena never RSTs a
-      // newcomer. Costs only pooled pbufs — bounded by HOLD_LIMIT.
-      if (!new_item && s_async_held_tls < SSL_HOLD_LIMIT) {
+      // newcomer. Costs only pooled pbufs — bounded by HOLD_LIMIT. Still refuse
+      // when heap is so low the 24B malloc itself would throw (OOM crash seen
+      // at ~976B free): abort instead of allocating.
+      if (!new_item && s_async_held_tls < SSL_HOLD_LIMIT &&
+          (unsigned)ESP.getFreeHeap() >= SSL_HOLD_MIN_HEAP) {
         new_item = (struct pending_pcb *)malloc(sizeof(struct pending_pcb));
         if (new_item) {
           new_item->pcb = pcb;
@@ -2427,9 +2436,10 @@ int8_t AsyncServer::_accept(tcp_pcb *pcb, int8_t err) {
       // Serve gate, two checks:
       //  - free heap >= 9000: don't start a serve that runs the arena to its
       //    crash point mid-flight (1072B alloc fail at ~4.5K = exception 29).
-      //  - maxblock >= slab (4506): the ctor needs one contiguous slab; a
-      //    fragmented arena below this aborts the conn and that asset's
-      //    retries keep missing -> intermittent "some .js not loading".
+      //  - maxblock >= server slab (~5.2KB): the ctor needs one contiguous
+      //    hole (4096 inbuf + ring); a fragmented arena below this aborts the
+      //    conn and that asset's retries keep missing -> intermittent
+      //    "some .js not loading".
       // Slab-sized does NOT latch (the old 9000-contiguity gate did): after a
       // conn closes, its freed slab is reused in place, so the hole always
       // exists even fully fragmented. Never raise to slab+margin — that

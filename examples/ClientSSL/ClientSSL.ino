@@ -1,7 +1,7 @@
 /*
  * AsyncTCP - ClientSSL example
  *
- * ESP32 HTTPS client with mutual TLS (mTLS) using AsyncTCP + AsyncTCPTLS.
+ * ESP32 HTTPS client with mutual TLS (mTLS) using AsyncTCP + AsyncSecureSession.
  * Connects to a server, presents a client certificate, and verifies the
  * server using a shared CA. The server must request client certificates
  * for mTLS to take effect.
@@ -33,7 +33,7 @@
  *     -pass pass:test123 -CAfile ca.pem -Verify 1 -www -port 4433
  *
  * Compile with:
- *   compiler.cpp.extra_flags=-DASYNC_TCP_SSL_ENABLED=1
+ *   compiler.cpp.extra_flags=-DASYNC_TCP_SSL_ENABLED=1 -DASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD=1
  */
 
 #ifdef ESP8266
