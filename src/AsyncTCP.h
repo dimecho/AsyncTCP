@@ -13,7 +13,7 @@
 #define ASYNCTCP_H_
 
 #include "AsyncTCPVersion.h"
-#include "AsyncTCPTLS.h"  // SSL/TLS
+#include "AsyncSecureSession.h"  // SSL/TLS
 #define ASYNCTCP_FORK_ESP32Async
 
 #ifdef ARDUINO
@@ -643,10 +643,10 @@ public:
       const unsigned char *clientKey = NULL, size_t clientKeyLen = 0,
       const char *keyPassword = NULL);
   bool startTLS(const char *host = "");
-  bool ssl() const { return _ssl_ctx != 0; }
+  bool ssl() const { return _secure != nullptr; }
   void setSSLReceiveTimeout(uint32_t timeout) { _ssl_timeout = timeout; }
   uint32_t getSSLReceiveTimeout() const { return _ssl_timeout; }
-  AsyncTCPTLS *getSSLContext() { return _ssl_ctx; }
+  AsyncSecureSession *getSSLContext() { return _secure; }
   void feedSSLRxData(const unsigned char *data, size_t len);
   bool hasSSLRxData() const;
   int sslRead(uint8_t *data, size_t len);
@@ -695,10 +695,10 @@ protected:
   int8_t _lwip_fin(tcp_pcb *pcb, int8_t err);
   void _dns_found(ip_addr_t *ipaddr);
 #if ASYNC_TCP_SSL_ENABLED
-  AsyncTCPTLS *_ssl_ctx;
+  AsyncSecureSession *_secure;       // replaces pre-refactor _ssl_ctx
   uint32_t _ssl_timeout;
   bool _ssl_handshake_done;
-  String _ssl_host;
+  String _ssl_host;                  // kept: SNI + "beginSecure requested" carrier
   const unsigned char *_ssl_ca_cert;
   size_t _ssl_ca_cert_len;
   const unsigned char *_ssl_client_cert;
@@ -707,8 +707,8 @@ protected:
   size_t _ssl_client_key_len;
   char *_ssl_key_password;
   void _clearSSLParams(void);
-  pbuf *_ssl_pending_pbufs;
-  AcConnectHandler _server_discard_cb;   // set by AsyncServer to trigger instant slot promote
+  pbuf *_staged_pbufs;               // was _ssl_pending_pbufs; transient only
+  AcConnectHandler _server_discard_cb;
   void *_server_discard_cb_arg;
 #endif
 };
@@ -764,15 +764,8 @@ protected:
   void *_ssl_file_cb_arg;
   const char *_ssl_key_password;
 
-  // Server-side session cache (TLS resumption), owned per instance, shared
-  // across this server's connections in startSSLServer().
-  // RAII: cache init'd in ctor, freed in dtor.
-  AsyncTCPTLSCache _ssl_session_cache;
-
-  // TLS admission queue: raw pcbs parked while the live serve budget
-  // (SSL_MAX_CONNECTIONS) is full. Oldest promotes on live-conn drop.
-  // Locking: all mutations on LwIP thread or under the lwIP core lock.
-  struct pending_pcb *_pending;
+  // Server-side TLS admission: session cache + bounded park queue.
+  AsyncSecureServerCtx _secureCtx;
 #endif
 
   int8_t _accept(tcp_pcb *newpcb, int8_t err);

@@ -6,42 +6,38 @@
 //   - ESP32/LIBRETINY -> mbedTLS stack (AsyncTCP ESP32Async base)
 // Selected at compile time via #if defined(ESP8266). Only one stack compiles per target.
 #if defined(ESP8266)
-// ===== begin BearSSL/ESP8266 AsyncTCPTLS.cpp (AsyncTCP) =====
+// ===== begin BearSSL/ESP8266 (AsyncTCP) =====
 /*
-  BearSSL glue layer for ESP8266AsyncTCP — single combined TU
-
   This file provides the complete BearSSL bridge in ONE compilation unit:
-    - the role-agnostic core (registry, per-connection state, engine pump) that
-      is shared by both TLS clients and TLS servers,
-    - the TLS-client-specific glue (x509, client engine init, tcp_ssl_new_client),
-    - the TLS-server-specific glue (cert/private-key ctx, tcp_ssl_new_server,
+    - the role-agnostic core (registry, per-connection state, engine pump)
+      shared by TLS clients and servers,
+    - the TLS-client glue (x509, client engine init, tcp_ssl_new_client),
+    - the TLS-server glue (cert/private-key ctx, tcp_ssl_new_server,
       tcp_ssl_has_client / tcp_ssl_client_count).
 
   Each role block is guarded by its own macro so builds can trim either role.
 
   FULLY PATCHED & COMPATIBLE VERSION:
-  - Uses the correct BearSSL API (`br_ssl_engine_set_buffers_bidi` with
-    separate buffers) for full compatibility with ESP8266 Arduino Core versions.
-  - Adds PROGMEM awareness to automatically handle certificates from flash,
-    fixing LoadStoreError crashes.
+  - Uses br_ssl_engine_set_buffers_bidi (separate buffers) for full
+    compatibility with ESP8266 Arduino Core versions.
+  - PROGMEM-aware: handles certs from flash, fixing LoadStoreError crashes.
   - Resolves incompatibility with older BearSSL PEM decoder APIs.
-  - Includes robust NULL checks to prevent crashes from invalid arguments.
+  - Robust NULL checks prevent crashes from invalid arguments.
   - BearSSL calls use the ESP8266 StackThunk mechanism, swapping to a
     separate heap-allocated stack for crypto operations.
 */
 
-#include "AsyncTCPTLS.h"
+#include "AsyncSecureSession.h"
 
 // When ASYNC_TCP_SSL_ENABLED is 0, this entire file compiles to nothing.
-// This prevents BearSSL types from being linked into non-SSL builds, which
-// would corrupt the heap memory layout on ESP8266's constrained DRAM.
+// Keeps BearSSL types out of non-SSL builds, which would corrupt the heap
+// layout on ESP8266's constrained DRAM.
 #if ASYNC_TCP_SSL_ENABLED
 #include "AsyncTCPLogging.h"
 
 // br_ssl_engine_new_max_frag_len() is declared in BearSSL's internal C-only
-// header (inner.h), which cannot be included from C++. Declare it here with
-// correct C linkage so the forced/offered-MFLN paths (server + client) link
-// against the C-compiled BearSSL object.
+// header (inner.h), not includable from C++. Declare it here with correct C
+// linkage so the MFLN paths (server + client) link against C-compiled BearSSL.
 extern "C" void br_ssl_engine_new_max_frag_len(br_ssl_engine_context* rc, unsigned max_frag_len);
 
 #include <StackThunk.h>
@@ -52,10 +48,10 @@ extern "C" void br_ssl_engine_new_max_frag_len(br_ssl_engine_context* rc, unsign
 
 // Mapped to the ESP8266 core's stack thunks. The thunk_br_ssl_engine_* symbols
 // are exported by the core's ESP8266WiFi BearSSLHelpers (libesp8266wifi.a), so
-// they are merely declared extern here and never defined locally — defining them
-// again via make_stack_thunk would clash with the core's copies in builds that
-// also use WiFiClientSecureBearSSL. Declared in namespace BearSSL (extern "C",
-// so the emitted symbol is the plain C thunk_* name).
+// they're declared extern here and never defined locally — defining them again
+// via make_stack_thunk would clash with the core's copies in builds that also
+// use WiFiClientSecureBearSSL. Declared in namespace BearSSL (extern "C", so
+// the emitted symbol is the plain C thunk_* name).
 namespace BearSSL {
 extern "C" {
 extern unsigned char *thunk_br_ssl_engine_recvapp_buf( const br_ssl_engine_context *cc, size_t *len);
@@ -69,9 +65,9 @@ extern void thunk_br_ssl_engine_sendrec_ack(br_ssl_engine_context *cc, size_t le
 }
 }
 
-// Use thunked BearSSL engine functions — swaps to a heap-allocated stack
-// for crypto operations, preventing stack overflow on ESP8266's 4KB CONT stack.
-// The thunks also provide a larger working stack for ECDHE P-256 key generation.
+// Use thunked BearSSL engine functions — swap to a heap-allocated stack for
+// crypto, preventing stack overflow on ESP8266's 4KB CONT stack. Also gives a
+// larger working stack for ECDHE P-256 key generation.
 #define br_ssl_engine_recvapp_ack  BearSSL::thunk_br_ssl_engine_recvapp_ack
 #define br_ssl_engine_recvapp_buf  BearSSL::thunk_br_ssl_engine_recvapp_buf
 #define br_ssl_engine_recvrec_ack  BearSSL::thunk_br_ssl_engine_recvrec_ack
@@ -91,7 +87,7 @@ BearSSL_SSL_CTX::~BearSSL_SSL_CTX() {
 // Linked list of all active BearSSL connections
 tcp_ssl_pcb* tcp_ssl_pcbs = nullptr;
 
-// Helper to find an SSL connection's state from its lwIP pcb
+// Find an SSL connection's state from its lwIP pcb
 tcp_ssl_pcb* find_ssl_pcb(struct tcp_pcb* pcb) {
   tcp_ssl_pcb* iter = tcp_ssl_pcbs;
   while (iter) {
@@ -103,10 +99,9 @@ tcp_ssl_pcb* find_ssl_pcb(struct tcp_pcb* pcb) {
   return nullptr;
 }
 
-// Shared between the client and server role TUs: allocate a tcp_ssl_pcb,
-// zero its non-role fields, and allocate the in/out/recvrec buffers.
-// Returns nullptr on allocation failure. The `tcp` and `is_server` fields are
-// set here; the role-specific engine initialization happens after this returns.
+// Shared between client and server role TUs: allocate a tcp_ssl_pcb, zero its
+// non-role fields, allocate in/out/recvrec buffers. Returns nullptr on alloc
+// failure. `tcp`/`is_server` set here; role engine init happens after return.
 tcp_ssl_pcb* tcp_ssl_alloc_pcb(struct tcp_pcb* pcb, bool is_server) {
   tcp_ssl_pcb* ssl_pcb = new (std::nothrow) tcp_ssl_pcb();
   if (!ssl_pcb) return nullptr;
@@ -167,8 +162,8 @@ tcp_ssl_pcb* tcp_ssl_alloc_pcb(struct tcp_pcb* pcb, bool is_server) {
   return ssl_pcb;
 }
 
-// Shared between the client and server role TUs: register a fully-initialized
-// ssl_pcb on the global TLS connection list and take a StackThunk reference.
+// Shared between client and server role TUs: register a fully-initialized
+// ssl_pcb on the global list and take a StackThunk reference.
 void tcp_ssl_register_pcb(tcp_ssl_pcb* ssl_pcb) {
   ssl_pcb->next = tcp_ssl_pcbs;
   tcp_ssl_pcbs = ssl_pcb;
@@ -228,9 +223,9 @@ size_t parse_certificates(const char* pem, std::vector<br_x509_certificate>& cer
   for (;;) {
     bool made_progress = false;
 
-    // Feed as much as the decoder accepts right now. br_pem_decoder_push()
-    // returns 0 as long as an event (BEGIN_OBJ/END_OBJ) is still pending, so
-    // feed and event-drain MUST be interleaved.
+    // Feed as much as the decoder accepts now. br_pem_decoder_push() returns 0
+    // while an event (BEGIN_OBJ/END_OBJ) is pending, so feed and event-drain
+    // MUST be interleaved.
     size_t r = br_pem_decoder_push(&pc, data + pushed, len - pushed);
     pushed += r;
     if (r > 0) made_progress = true;
@@ -270,9 +265,8 @@ size_t parse_certificates(const char* pem, std::vector<br_x509_certificate>& cer
     if (!made_progress) break;   // stalled, no event and no progress -> done/error
   }
 
-  // BearSSL decodes the body to the dest callback but, in this one-shot call
-  // pattern, may never emit END_OBJ for the final object (observed: full cert
-  // DER received, END_OBJ event never fired). Finalize any leftover buffer.
+  // In this one-shot pattern BearSSL may never emit END_OBJ for the final
+  // object, so finalize any leftover buffer.
   if (in_cert_object && pctx.buf && pctx.len > 0) {
     certs.push_back({pctx.buf, pctx.len});
     pctx.buf = nullptr;
@@ -306,9 +300,9 @@ int tcp_ssl_free(struct tcp_pcb* pcb) {
       delete iter;
       async_tcp_log_d("FREE: free heap=%u\n", (unsigned)ESP.getFreeHeap());
       if (!tcp_ssl_pcbs) {
-        // All TLS conns drained: print the true idle floor, then ask the server
-        // to flush its parked queue (parked pcbs pin the previous page's pbuf
-        // chains and can hold free heap below the bar).
+        // All TLS conns drained: print the true idle floor, then flush the
+        // parked queue (parked pcbs pin prior page's pbuf chains, holding free
+        // heap below the bar).
         async_tcp_log_i("SETTLED: conns=%lu, parked=%u, free heap=%u, maxblock=%u, frag=%u%%, shells=%d\n",
                         tcp_ssl_serve_conns_total(), tcp_ssl_parked_count(),
                         (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize(),
@@ -324,12 +318,11 @@ int tcp_ssl_free(struct tcp_pcb* pcb) {
 }
 
 // Graceful TLS close (best effort):
-// Flush any buffered plaintext, drain a deferred SENDREC record, assemble a
-// close_notify alert, and queue it to lwIP so the subsequent tcp_close() FINs
-// only after it is transmitted. Returns the number of bytes queued for this
-// close, 0 when nothing could be written (no ssl layer, window/memp starved,
-// or the engine already closed). The caller proceeds to free the engine and
-// tcp_close() regardless.
+// Flush buffered plaintext, drain a deferred SENDREC record, assemble a
+// close_notify alert, and queue it to lwIP so the later tcp_close() FINs only
+// after it is transmitted. Returns bytes queued (0 when nothing could be
+// written: no ssl layer, window/memp starved, or engine already closed). The
+// caller frees the engine and tcp_close()s regardless.
 size_t tcp_ssl_close(struct tcp_pcb* pcb) {
   size_t pcb_written = 0;
   tcp_ssl_pcb* ssl_pcb = find_ssl_pcb(pcb);
@@ -339,9 +332,9 @@ size_t tcp_ssl_close(struct tcp_pcb* pcb) {
   // Already closed or never opened: nothing to assemble.
   if (br_ssl_engine_current_state(eng) & BR_SSL_CLOSED) return 0;
 
-  // Flush any buffered plaintext into a TLS record first, so the close_notify
-  // below cannot cut trailing application data (a scheduled engine pass may
-  // not have run yet when a response finishes and the connection is closed).
+  // Flush buffered plaintext into a record first so the close_notify below
+  // cannot cut trailing app data (a scheduled engine pass may not have run yet
+  // when a response finishes and the connection is closed).
   if (br_ssl_engine_current_state(eng) & BR_SSL_SENDAPP) {
     br_ssl_engine_flush(eng, 0);
     size_t plen = 0;
@@ -355,8 +348,8 @@ size_t tcp_ssl_close(struct tcp_pcb* pcb) {
     }
   }
 
-  // Drain any SENDREC record that was deferred earlier (tcp_write blocked on a
-  // full window). It is still pending in the engine (not acked); if the window
+  // Drain any SENDREC record deferred earlier (tcp_write blocked on a full
+  // window). Still pending in the engine (not acked); if the window
   // has room now, push it before the close_notify so no response tail is cut.
   if (ssl_pcb->sendrec_deferred && (br_ssl_engine_current_state(eng) & BR_SSL_SENDREC)) {
     size_t plen = 0;
@@ -385,10 +378,9 @@ size_t tcp_ssl_close(struct tcp_pcb* pcb) {
 
 // --- Internal Engine Logic ---
 
-// Defer process_ssl_engine to loop() context via schedule_function.
-// The BearSSL engine calls made from loop() run on the thunked stack
-// (defined above) so crypto operations get a larger working stack than the
-// ESP8266's 4KB CONT stack.
+// Defer process_ssl_engine to loop() context via schedule_function. The
+// BearSSL engine calls from loop() run on the thunked stack (above), giving
+// crypto a larger working stack than the ESP8266's 4KB CONT stack.
 void schedule_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
   schedule_function([ssl_pcb]() {
     for (tcp_ssl_pcb* iter = tcp_ssl_pcbs; iter; iter = iter->next) {
@@ -402,10 +394,9 @@ void schedule_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
 
 // Returns true if ssl_pcb is still a live member of tcp_ssl_pcbs.
 // process_ssl_engine calls yield() which can re-enter the event loop; while
-// yielding, the same connection (or another) may run
-// _close() -> tcp_ssl_free() -> delete this ssl_pcb. On return from yield()
-// the pointer would be dangling, so every yield() boundary must re-validate
-// that the ssl_pcb is still registered before dereferencing it again.
+// yielding, this conn (or another) may run _close() -> tcp_ssl_free() ->
+// delete ssl_pcb, leaving the pointer dangling on return. So every yield()
+// boundary must re-validate that the ssl_pcb is still registered.
 static bool tcp_ssl_pcb_is_alive(tcp_ssl_pcb* ssl_pcb) {
   for (tcp_ssl_pcb* iter = tcp_ssl_pcbs; iter; iter = iter->next) {
     if (iter == ssl_pcb) return true;
@@ -423,12 +414,10 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
   size_t accum_len = ssl_pcb->recvrec_accum_len;
 
   if (accum_len > 0) {
-    // MEASUREMENT: report the largest inbound TLS record ciphertext length we
-    // see. Peek the header bytes (3-4 = big-endian length) of the first pending
-    // record, but ONLY when the engine is at a fresh record-start boundary
-    // (ixa==ixb==0) so we don't mis-read bytes mid-record. Records are logged
-    // only on a new max, to avoid noise from the many small records of normal
-    // page loads.
+    // MEASUREMENT: report the largest inbound TLS record ciphertext length.
+    // Peek header bytes 3-4 (big-endian length) of the first pending record,
+    // but ONLY at a fresh record-start boundary (ixa==ixb==0) to avoid
+    // mis-reading mid-record. Log only on a new max to reduce noise.
     if (accum_len >= 5 && eng->ixa == 0 && eng->ixb == 0) {
       size_t rlen = ((size_t)ssl_pcb->recvrec_accum[3] << 8) | ssl_pcb->recvrec_accum[4];
       if (rlen > ssl_pcb->max_rec_len) {
@@ -474,9 +463,9 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
     if (!tcp_ssl_pcb_is_alive(ssl_pcb)) return;  // freed while yielding
     state = br_ssl_engine_current_state(eng);
 
-    // Flush any buffered plaintext into a TLS record so the SENDREC branch
-    // below can transmit it. Done here (not per-write) to keep BR_SSL_SENDAPP
-    // open across the synchronous header+content burst in tcp_ssl_write.
+    // Flush buffered plaintext into a record so the SENDREC branch below can
+    // transmit it. Done here (not per-write) to keep BR_SSL_SENDAPP open across
+    // the synchronous header+content burst in tcp_ssl_write.
     if (state & BR_SSL_SENDAPP) {
       br_ssl_engine_flush(eng, 0);
     }
@@ -484,17 +473,17 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
     if (state & BR_SSL_CLOSED) {
       int err = br_ssl_engine_last_error(eng);
       async_tcp_log_d("PSE: CLOSED err=%d\n", err);
-      // Session-resumption debug: if the server dies during the handshake it
-      // is usually a resume-path failure (bad_record_mac/decrypt_error on an
-      // abbreviated handshake in BearSSL). Log the decoded alert loudly.
+      // Session-resumption debug: if the server dies mid-handshake it's
+      // usually a resume-path failure (bad_record_mac/decrypt_error on the
+      // abbreviated handshake). Log the decoded alert loudly.
       if (!ssl_pcb->handshake_done && ssl_pcb->is_server) {
         async_tcp_log_e("PSE: server handshake FAILED err=%d (%s), free heap=%u, accum=%u\n",
                         err, tcp_ssl_error_string(err), (unsigned)ESP.getFreeHeap(),
                         (unsigned)ssl_pcb->recvrec_accum_len);
       }
-      // Re-check liveness: the engine may have been torn down (e.g. a
-      // scheduled SSL error callback or an app close) during an intervening
-      // yield(). Firing on_error on a freed ssl_pcb would walk freed memory.
+      // Re-check liveness: the engine may have been torn down (scheduled error
+      // callback or app close) during a yield(). Firing on_error on a freed
+      // ssl_pcb would walk freed memory.
       if (!tcp_ssl_pcb_is_alive(ssl_pcb)) return;
       if (ssl_pcb->on_error) {
         ssl_pcb->on_error(ssl_pcb->arg, ssl_pcb->tcp, err);
@@ -502,11 +491,11 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
       return;
     }
 
-    // Declare the handshake complete BEFORE delivering any application data.
-    // on_handshake fires the AsyncServer's connect callback, which is what
-    // creates the AsyncWebServerRequest and registers its data callback. If
-    // RECVAPP data (the first HTTP request) were delivered first, it would be
-    // handed to a NULL callback and silently dropped.
+    // Declare the handshake complete BEFORE delivering any app data.
+    // on_handshake fires the AsyncServer's connect callback, which creates the
+    // AsyncWebServerRequest and registers its data callback. Delivering RECVAPP
+    // (the first HTTP request) first would hand it to a NULL callback and drop
+    // it silently.
     if (!ssl_pcb->handshake_done) {
       bool hs_done = (ssl_pcb->is_server && (state & BR_SSL_RECVAPP)) ||
                      (!ssl_pcb->is_server && (state & BR_SSL_SENDAPP));
@@ -533,17 +522,16 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
     // Every outbound record — handshake AND app data — goes through the
     // multi-record NO-COPY ring. Each record is copied out of BearSSL's single
     // engine outbuf into a free slab slot, tcp_write (no-copy) pins the slot
-    // until the peer ACKs, and br_ssl_engine_sendrec_ack lets the engine build
-    // the NEXT record into outbuf. K slots => K records in flight per RTT with
-    // ZERO per-record heap allocation. When all K slots are pinned we wait for
-    // ACKs (tcp_ssl_sent frees slots FIFO and re-arms the engine).
+    // until the peer ACKs, and sendrec_ack lets the engine build the NEXT
+    // record into outbuf. K slots => K records in flight per RTT, ZERO per-record
+    // heap allocation. When all K slots are pinned, wait for ACKs (tcp_ssl_sent
+    // frees slots FIFO and re-arms the engine).
     //
-    // The handshake MUST stay on this heap-free path too: the old COPY emitter
-    // allocated a PBUF_RAM from the heap per record, which failed with ERR_MEM
-    // whenever the arena fragmented below record size during refresh churn
-    // (largest-block ~176B vs a ~1KB flight record) — the SENDREC hard-stall
-    // that wedged all browser loads. No app data exists mid-handshake, so the
-    // single ring slot is always available to handshake flights.
+    // The handshake MUST stay on this path: the old COPY emitter malloc'd a
+    // PBUF_RAM per record, which failed with ERR_MEM when the arena fragmented
+    // below record size during refresh churn (~176B largest block vs ~1KB
+    // flight) — wedging all browser loads. No app data mid-handshake, so the
+    // single ring slot is always free for flights.
     if (ssl_pcb->out_ring_pinned >= SSL_RECORD_RING_SLOTS) {
       break;  // ring full — wait for ACK; tcp_ssl_sent re-arms if SENDREC is set
     }
@@ -553,21 +541,20 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
       // lwIP gates tcp_write on BOTH the byte window (snd_buf) and the pbuf
       // queue depth (snd_queuelen vs TCP_SND_QUEUELEN). The sndbuf boost sets
       // only snd_buf (8*TCP_MSS), NOT TCP_SND_QUEUELEN, so a burst of records
-      // can fill the pbuf queue while snd_buf still shows room and tcp_write
-      // fails with ERR_MEM even though the window looks open. The record is
-      // NOT consumed until sendrec_ack, so on failure we leave it pending and
-      // defer to a later pass once the queue drains — never abort (that would
-      // drop a recoverable stream and tear down a healthy connection).
+      // can fill the pbuf queue while snd_buf shows room -> tcp_write fails
+      // ERR_MEM even though the window looks open. The record is NOT consumed
+      // until sendrec_ack, so on failure we leave it pending and defer to a
+      // later pass once the queue drains — never abort (that would drop a
+      // recoverable stream and tear down a healthy connection).
       if (tcp_sndbuf(ssl_pcb->tcp) >= ssl_pcb->out_len &&
           tcp_sndqueuelen(ssl_pcb->tcp) < TCP_SND_QUEUELEN) {
         // tcp_write still needs a small PBUF_RAM header pbuf from the heap and
-        // a MEMP_TCP_SEG/MEMP_PBUF_ROM from the static pools for EACH segment,
-        // COPY or not. Data bytes are never heap-allocated: every record
-        // (handshake AND app) is memcpy'd into a slab ring slot and written
-        // NO-COPY (TCP_WRITE_FLAG_COPY=0), so tcp_write references the slab
-        // directly and only the small per-segment memp/header entries come from
-        // pools. The ONE exception is the graceful close_notify branch below
-        // (tiny, once, at stream end). K slots in flight / RTT.
+        // a MEMP_TCP_SEG/MEMP_PBUF_ROM from static pools for EACH segment, COPY
+        // or not. Data bytes are never heap-allocated: every record is memcpy'd
+        // into a slab ring slot and written NO-COPY, so tcp_write references the
+        // slab directly; only the small per-segment memp/header entries come
+        // from pools. The ONE exception is the graceful close_notify branch
+        // below (tiny, once, at stream end). K slots in flight / RTT.
         err_t werr;
         {
           uint8_t slot = ssl_pcb->out_ring_next;
@@ -581,31 +568,29 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
         }
         if (werr == ERR_OK) {
           // Record queued. Free the ENGINE outbuf now so BearSSL builds the
-          // next record: no COPY write moved the bytes (they live in the ring
-          // slot's memcpy'd copy), so the engine buffer is always free to
-          // reuse. Ring/flag state was committed above.
+          // next record: the bytes live in the ring slot's memcpy'd copy, so
+          // the engine buffer is always free to reuse. Ring/flag state was
+          // committed above.
           br_ssl_engine_sendrec_ack(eng, ssl_pcb->out_len);
           ssl_pcb->sendrec_deferred = false;  // pending record transmitted
           ssl_pcb->hard_defer_start = 0;      // un-wedged; clear the stall clock
           tcp_output(ssl_pcb->tcp);
           continue;
         }
-        // tcp_write failed. The record is NOT consumed (we did not ack it),
-        // so do not abort — defer and retry once the send window / pbuf queue
-        // has room. The ring slot stays free (app path); the engine still
-        // holds the record. Mark the record as deferred so tcp_ssl_sent()
-        // re-arms the engine on the next ACK; we do NOT reschedule here (that
-        // would busy-loop, and schedule_function has a bounded pool).
+        // tcp_write failed. The record is NOT consumed (we did not ack it), so
+        // do not abort — defer and retry once the send window / pbuf queue has
+        // room. The ring slot stays free (app path); the engine still holds
+        // the record. Mark it deferred so tcp_ssl_sent() re-arms the engine on
+        // the next ACK; we do NOT reschedule here (that would busy-loop, and
+        // schedule_function has a bounded pool).
         ssl_pcb->sendrec_deferred = true;
-        // Distinguish a RECOVERABLE defer (send window / pbuf queue full — an
-        // ACK will free space and tcp_ssl_sent re-arms us) from a HARD stall
-        // (open sndbuf + empty queuelen yet tcp_write still fails: the system
-        // heap / static memp pool is exhausted). In the hard case nothing is on
-        // the wire, so NO ACK can ever arrive to re-arm the deferred record —
-        // the connection is permanently wedged. Start a stall clock so
-        // tcp_ssl_is_stalled()/AsyncClient::_poll can reset it after a bounded
-        // delay instead of hanging forever. A recoverable defer clears the clock
-        // (an ACK is expected shortly).
+        // Distinguish a RECOVERABLE defer (window / pbuf queue full — an ACK
+        // will free space and tcp_ssl_sent re-arms us) from a HARD stall (open
+        // sndbuf + empty queuelen yet tcp_write still fails: system heap / static
+        // memp pool exhausted). Hard case has nothing on the wire, so no ACK can
+        // ever re-arm the record — the conn is permanently wedged. Start a stall
+        // clock so tcp_ssl_is_stalled()/AsyncClient::_poll resets it after a
+        // bounded delay. A recoverable defer clears the clock (ACK expected).
         if (tcp_sndbuf(ssl_pcb->tcp) >= ssl_pcb->out_len &&
             tcp_sndqueuelen(ssl_pcb->tcp) == 0) {
           if (ssl_pcb->hard_defer_start == 0) {
@@ -613,20 +598,19 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
             // One-shot report at stall onset. With the no-copy ring this can
             // only mean static memp (TCP_SEG/PBUF) exhaustion or a lwIP
             // conservative-window refusal — not the COPY-pbuf fragmentation of
-            // the old pipeline. ESP.getFreeHeap() is the LARGEST contiguous
-            // free block, not total free; if it is far below the total, the
-            // heap is fragmented even though the ring itself needs no heap.
+            // the old pipeline. ESP.getFreeHeap() is the LARGEST contiguous free
+            // block, not total free; far below total = fragmented heap, though
+            // the ring itself needs no heap.
             async_tcp_log_v("SENDREC hard-stall: heap total-free=%u largest-block=%u\n",
                             (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize());
           }
         } else {
           ssl_pcb->hard_defer_start = 0;  // window/queue-full: ACK will free space
         }
-        // Nudge lwIP to transmit whatever is already queued: the queue may be
-        // full with pbufs that are waiting for an output push, and if those
-        // never go out the peer never ACKs so the queue never drains and the
-        // deferred record can never fit. tcp_output() is idempotent and safe to
-        // call repeatedly (it only sends if there is unsent data).
+        // Nudge lwIP to transmit queued pbufs: if they never go out the peer
+        // never ACKs, so the queue never drains and the deferred record can't
+        // fit. tcp_output() is idempotent and safe to call repeatedly (only
+        // sends if there is unsent data).
         tcp_output(ssl_pcb->tcp);
         async_tcp_log_v("SENDREC: defer err=%d out=%u sndbuf=%u queuelen=%u/%u freeheap=%u hard=%u\n",
                         (int)werr,
@@ -644,12 +628,12 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
 
   if (!tcp_ssl_pcb_is_alive(ssl_pcb)) return;  // freed while yielding
 
-  // If the engine still has a SENDREC record pending that the bounded feed loop
-  // reached its iteration cap without emitting (e.g. a handshake flight split
-  // into many small records by a small OUT buffer), reschedule so it continues.
-  // This must NOT fire on the pbuf-alloc-failure defer path (sendrec_deferred
-  // is set) or while the record ring is full (out_ring_pinned == K — we wait
-  // for the ACKs in tcp_ssl_sent to open slots), either of which would busy-loop.
+  // If the engine still has a SENDREC record the bounded feed loop hit its
+  // iteration cap without emitting (e.g. a handshake flight split into many
+  // small records by a small OUT buffer), reschedule so it continues. Must NOT
+  // fire on the pbuf-alloc-failure defer path (sendrec_deferred set) or while
+  // the ring is full (out_ring_pinned == K — we wait for ACKs in tcp_ssl_sent
+  // to open slots), either of which would busy-loop.
   if (ssl_pcb->sendrec_deferred == false &&
       ssl_pcb->out_ring_pinned < SSL_RECORD_RING_SLOTS) {
     state = br_ssl_engine_current_state(eng);
@@ -671,32 +655,30 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
   }
 }
 
-// Called from the lwIP _sent callback (ESP8266AsyncTCP.cpp) whenever the peer
-// ACKs TLS ciphertext, freeing send-window / pbuf-queue space. Released ring
-// slots hold the ACKed records (the peer ACKed the ciphertext, so the data is
-// safe to overwrite), then re-arms the engine whenever it still has a SENDREC
-// record queued to emit. This covers:
+// Called from the lwIP _sent callback (ESPAsyncTCP.cpp) whenever the peer ACKs
+// TLS ciphertext, freeing send-window / pbuf-queue space. Released ring slots
+// hold the ACKed records (ACKed ciphertext = safe to overwrite), then re-arms
+// the engine whenever it still has a SENDREC record queued. This covers:
 //  (1) a record previously deferred on pbuf-alloc ERR_MEM (sendrec_deferred) — retry
 //      now that the ACK freed queue/window space, and
 //  (2) the end of a ring: all K slots exhausted means the feed loop stopped
 //      with the engine still holding the next unfinished record, needing the
 //      next ACK's freed slots before it can emit again.
-// Gating on the engine's SENDREC state (not on the ring alone) keeps this safe:
-// idle / finished connections sit in BR_SSL_SENDAPP waiting for the app, NOT in
-// SENDREC, so their ACKs do NOT spam schedule_ssl_engine.
+// Gating on SENDREC state (not the ring alone) keeps this safe: idle/finished
+// conns sit in BR_SSL_SENDAPP, NOT SENDREC, so their ACKs don't spam
+// schedule_ssl_engine.
 void tcp_ssl_sent(struct tcp_pcb* pcb, size_t acked) {
   if (!pcb) return;
   tcp_ssl_pcb* ssl_pcb = find_ssl_pcb(pcb);
   if (!ssl_pcb) return;
   // Free ring slots FIFO as ciphertext ACKs land. lwIP's sent callback reports
-  // the bytes ACKed SINCE the last callback, but application records are
-  // larger than a single MSS (1053B ciphertext across two 536B segments), so a
-  // record usually completes only after several 536B-ish ACKs. Comparing the
-  // per-callback delta against whole record sizes would strand the oldest slot
-  // forever (delayed ACK never reports one full record at once) and the ring
-  // would wedge mid-transfer. Accumulate into a running total instead:
-  // release a slot only once the running total covers its length, then debit
-  // exactly that record before checking the next-oldest.
+  // the bytes ACKed SINCE the last callback, but app records are larger than
+  // one MSS (1053B ciphertext across two 536B segments), so a record usually
+  // completes only after several 536B-ish ACKs. Comparing the per-callback
+  // delta against whole record sizes would strand the oldest slot forever
+  // (delayed ACK never reports one full record at once) and wedge the ring.
+  // Accumulate into a running total instead: release a slot only once the
+  // total covers its length, then debit that record before the next-oldest.
   ssl_pcb->out_ring_acked += (uint32_t)acked;
   while (ssl_pcb->out_ring_pinned > 0) {
     uint8_t oldest = (uint8_t)((ssl_pcb->out_ring_next - ssl_pcb->out_ring_pinned +
@@ -721,22 +703,21 @@ void tcp_ssl_sent(struct tcp_pcb* pcb, size_t acked) {
   }
 }
 
-// Returns true once this connection has been in a HARD SENDREC stall (open
-// send window + empty pbuf queue yet tcp_write still failing = system-heap /
-// static-memp-pool exhaustion, with nothing on the wire so no ACK can un-wedge
-// it) for longer than stall_ms. AsyncClient::_poll calls this each poll to
-// bound an otherwise-permanent wedge, tearing the connection down so the
-// browser retries on a fresh connection.
+// Returns true once this conn has been in a HARD SENDREC stall (open send
+// window + empty pbuf queue yet tcp_write still failing = system-heap /
+// static-memp-pool exhaustion, nothing on the wire so no ACK can un-wedge it)
+// for longer than stall_ms. AsyncClient::_poll calls this each poll to bound
+// an otherwise-permanent wedge, tearing the conn down so the browser retries.
 //
 // hard_defer_start is armed ONLY when tcp_sndqueuelen == 0 (the emitter sets
-// it in the failure branch guarded by that check), so ANY hard defer has
-// nothing in flight: no ACK can ever arrive, and the only thing that clears it
-// is a later record transmit (poll retry succeeding once a sibling conn frees
-// pool/heap). There is therefore no "mid-body = self-recovering" state to
-// protect — a hard defer is equally wedged before and after the first app
-// record. The reset applies unconditionally; if a records starts streaming the
-// stall clock is cleared and this never fires. Truncating a response whose
-// allocs cannot resolve is the correct recovery (browser retries cleanly).
+// it in the failure branch guarded by that check), so any hard defer has
+// nothing in flight: no ACK can arrive, and only a later record transmit (poll
+// retry succeeding once a sibling conn frees pool/heap) clears it. There is no
+// "mid-body = self-recovering" state to protect — a hard defer is equally
+// wedged before and after the first app record. Reset applies unconditionally;
+// once a record streams the stall clock clears and this never fires. Truncating
+// a response whose allocs cannot resolve is the correct recovery (browser
+// retries cleanly).
 bool tcp_ssl_is_stalled(struct tcp_pcb* pcb, uint32_t stall_ms) {
   tcp_ssl_pcb* ssl_pcb = find_ssl_pcb(pcb);
   if (!ssl_pcb) return false;
@@ -787,7 +768,6 @@ int tcp_ssl_read(struct tcp_pcb* pcb, struct pbuf* pb) {
   // ---- Accumulate data from lwIP callback into recvrec_accum ----
   // NO BearSSL calls here — we're in lwIP context (no yield allowed).
   // All BearSSL feeding happens in process_ssl_engine (loop() context).
-
   size_t remaining = pb->tot_len;
   size_t pb_offset = 0;
 
@@ -876,20 +856,16 @@ const char* tcp_ssl_error_string(int err) {
   =====================================================================
 */
 /*
-  BearSSL client glue layer for ESP8266AsyncTCP
-
-  This file contains the TLS-client-specific glue: the x509 insecure
-  decoder, the client cipher suites, engine base init, and connection
-  setup. It is compiled whenever ASYNC_TCP_SSL_ENABLED is set, alongside
-  the server glue. Include "ESP8266AsyncTCPClient.h" in a project that uses
-  client TLS.
+  TLS-client glue: the x509 insecure decoder, client cipher suites, engine
+  base init, and connection setup. Compiled whenever ASYNC_TCP_SSL_ENABLED is
+  set (alongside the server glue). Include "ESPAsyncTCPClient.h" to use it.
 */
 
 // NOTE: TLS.h must be included FIRST because it defines the
-// ASYNC_TCP_SSL_ENABLED / ASYNC_TCP_SSL_ENABLE_CLIENT macros that the guard
-// below tests. If this include came after the #if, the macros would be
-// undefined here and the whole file would be preprocessed out.
-#include "AsyncTCPTLS.h"
+// ASYNC_TCP_SSL_ENABLED / ASYNC_TCP_SSL_ENABLE_CLIENT macros the guard below
+// tests. If this include came after the #if, the macros would be undefined
+// here and the whole file would preprocess out.
+#include "AsyncSecureSession.h"
 
 #if ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_CLIENT
 
@@ -1057,8 +1033,7 @@ int tcp_ssl_new_client(struct tcp_pcb* pcb, const char* host, const br_x509_clas
   br_ssl_client_base_init(ssl_pcb->sc_client, suites_P, sizeof(suites_P) / sizeof(suites_P[0]));
 
 #if SSL_CLIENT_MFLN
-  // Offer max_fragment_length (RFC 6066) to the mail server; must precede
-  // br_ssl_client_reset (handshake start).
+  // Offer max_fragment_length (RFC 6066); must precede br_ssl_client_reset.
   br_ssl_engine_new_max_frag_len(&ssl_pcb->sc_client->eng, SSL_CLIENT_MFLN);
 #endif
 
@@ -1101,19 +1076,16 @@ int tcp_ssl_new_client(struct tcp_pcb* pcb, const char* host, const br_x509_clas
   =====================================================================
 */
 /*
-  BearSSL server glue layer for ESP8266AsyncTCP
-
-  This file contains the TLS-server-specific glue: certificate/private-key
-  context parsing and connection setup. It is compiled whenever
-  ASYNC_TCP_SSL_ENABLED is set, alongside the client glue. Include
-  "ESP8266AsyncTCPServer.h" in a project that uses server TLS.
+  TLS-server glue: certificate/private-key context parsing and connection
+  setup. Compiled whenever ASYNC_TCP_SSL_ENABLED is set (alongside the client
+  glue). Include "ESPAsyncTCPServer.h" to use it.
 */
 
 // NOTE: TLS.h must be included FIRST because it defines the
-// ASYNC_TCP_SSL_ENABLED / ASYNC_TCP_SSL_ENABLE_SERVER macros that the guard
-// below tests. If this include came after the #if, the macros would be
+// ASYNC_TCP_SSL_ENABLED / ASYNC_TCP_SSL_ENABLE_SERVER macros the guard below
+// tests. If this include came after the #if, the macros would be
 // undefined here and the whole file would be preprocessed out.
-#include "AsyncTCPTLS.h"
+#include "AsyncSecureSession.h"
 
 #if ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_SERVER
 
@@ -1133,12 +1105,12 @@ static void br_ssl_server_init_lean(br_ssl_server_context* cc,
     const br_x509_certificate* chain, size_t chain_len,
     const br_ec_private_key* ec, const br_rsa_private_key* rsa);
 
-// Normalize a PEM string for feeding to BearSSL's decoder: copy it out of flash
-// (PROGMEM) into RAM and, unless it already ends with a newline, append one.
-// BearSSL's PEM decoder requires the final "-----END ...-----" line to be
-// newline-terminated, otherwise the trailing line (and thus the whole object)
-// can be dropped, causing the cert/key load to fail. Returns the owning buffer
-// (kept alive by the caller) and repoints `out` to the NUL-terminated string.
+// Normalize a PEM string for BearSSL: copy it out of flash (PROGMEM) into RAM
+// and, unless it already ends with a newline, append one. BearSSL's PEM
+// decoder requires the final "-----END ...-----" line to be newline-terminated,
+// else the trailing line (and whole object) drops, failing the load. Returns
+// the owning buffer (kept alive by caller) and repoints `out` to the
+// NUL-terminated string.
 static std::unique_ptr<char[]> normalize_pem(const char* src, const char*& out) {
   if (!src) { out = nullptr; return nullptr; }
   bool in_flash = (uint32_t)src >= 0x40200000;
@@ -1164,9 +1136,9 @@ BearSSL_SSL_CTX* tcp_ssl_new_server_ctx(const char* cert_pem, const char* privat
   }
 
   // --- START: PROGMEM AWARENESS + TRAILING-NEWLINE PATCH ---
-  // Copy each PEM out of flash into RAM and ensure a trailing '\n' (BearSSL's
-  // PEM decoder drops the final object if its "END" line is not newline
-  // terminated). The owning buffers must outlive the parses below, so they are
+  // Copy each PEM from flash into RAM and ensure a trailing '\n' (BearSSL's
+  // PEM decoder drops the final object if its "END" line isn't newline
+  // terminated). The owning buffers must outlive the parses below, so they're
   // held as locals for the lifetime of this function.
   std::unique_ptr<char[]> cert_ram_buf;
   std::unique_ptr<char[]> key_ram_buf;
@@ -1213,9 +1185,9 @@ BearSSL_SSL_CTX* tcp_ssl_new_server_ctx(const char* cert_pem, const char* privat
     return nullptr;
   }
 
-  // Session-resumption cache: initialize once per server context, shared by
-  // every connection this server accepts. Without it every reconnect (and
-  // every HTTP resource fetched over a new connection) pays a full handshake.
+  // Session-resumption cache: init once per server ctx, shared by every conn
+  // it accepts. Without it every reconnect (and every HTTP resource on a new
+  // conn) pays a full handshake.
   br_ssl_session_cache_lru_init(&ctx->session_cache, ctx->session_store, sizeof(ctx->session_store));
 
   // Init the shared server engine once (chain, ciphers, curve). Per-conn
@@ -1224,15 +1196,13 @@ BearSSL_SSL_CTX* tcp_ssl_new_server_ctx(const char* cert_pem, const char* privat
                           ctx->chain_vector.size(), ctx->pk->getEC(), ctx->pk->getRSA());
   br_ssl_server_set_cache(&ctx->server_ctx, &ctx->session_cache.vtable);  // persists across resets
 
-  // PIN the shared BearSSL StackThunk stack (6200 B of DRAM) by taking once,
-  // at server-setup time when the heap is clean, a reference that is never
-  // released during the server's lifetime. The per-connection refs taken in
-  // tcp_ssl_register_pcb() keep the count >= 1, so the stack, once allocated
-  // here, is never freed and re-malloc'd as serialized connections oscillate
-  // the refcount 0<->1. Without this, each new connection after the last one
-  // closed re-allocates the stack with a 6200-byte DRAM malloc, which can fail
-  // (abort -> "User exception (panic/abort/assert)") when the DRAM heap is
-  // fragmented by connection churn (observed on the second page hammer).
+  // PIN the shared BearSSL StackThunk stack (6200 B of DRAM): take once at
+  // server-setup (heap clean), never released for the server's lifetime. The
+  // per-conn refs in tcp_ssl_register_pcb() keep the count >= 1, so the stack
+  // is never freed and re-malloc'd as serialized conns oscillate the refcount
+  // 0<->1. Otherwise each new conn after the last closed re-allocs the stack
+  // with a 6200-byte DRAM malloc, which can abort
+  // ("User exception (panic/abort/assert)") when DRAM is fragmented by churn.
   stack_thunk_add_ref();
 
   return ctx;
@@ -1291,8 +1261,8 @@ int tcp_ssl_new_server(struct tcp_pcb* pcb, BearSSL_SSL_CTX* ssl_ctx) {
   }
 
   // Force MFLN (RFC 6066 max_fragment_length) = 1024 on the server.
-  // Per br_ssl_engine_new_max_frag_len(), this caps every outbound record's
-  // plaintext (including the handshake Certificate flight) at 1024 bytes.
+  // br_ssl_engine_new_max_frag_len() caps every outbound record's plaintext
+  // (incl. the handshake Certificate flight) at 1024 bytes.
 #if SSL_SERVER_MFLN && SSL_SERVER_MFLN != 0
   br_ssl_engine_new_max_frag_len(&ssl_pcb->sc_server->eng, SSL_SERVER_MFLN);
 #endif
@@ -1317,9 +1287,9 @@ uint8_t tcp_ssl_client_count() {
 }
 
 #endif  // ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_SERVER
-// ===== end BearSSL/ESP8266 AsyncTCPTLS.cpp =====
+// ===== end BearSSL/ESP8266 =====
 #else
-// ===== begin mbedTLS/ESP32 AsyncTCPTLS.cpp (AsyncTCP) =====
+// ===== begin mbedTLS/ESP32 AsyncSecureSession.cpp (AsyncTCP) =====
 // SPDX-License-Identifier: LGPL-3.0-or-later
 // SSL/TLS support for AsyncTCP using mbedTLS over LwIP raw TCP (tcp_pcb)
 // Custom BIO callbacks replace BSD socket mbedtls_net_send/mbedtls_net_recv
@@ -1334,7 +1304,7 @@ extern "C" {
 #include "lwip/tcp.h"
 }
 
-#include "AsyncTCPTLS.h"
+#include "AsyncSecureSession.h"
 
 #if !defined(MBEDTLS_KEY_EXCHANGE__SOME__PSK_ENABLED) && !defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
 #  warning "PSK ciphersuites not configured — PSK TLS overloads will be unavailable"
@@ -1417,11 +1387,11 @@ static err_t _tcp_ssl_write(tcp_pcb *pcb, const void *data, size_t size, uint8_t
 /*
  * Custom LwIP BIO callbacks for mbedTLS
  * These bridge mbedTLS's I/O with LwIP raw TCP (tcp_pcb).
- * The void* ctx points to the AsyncTCPTLS instance.
+ * The void* ctx points to the AsyncSecureSession instance.
  */
 
 static int _lwip_ssl_send(void *ctx, const unsigned char *buf, size_t len) {
-    AsyncTCPTLS *sslctx = (AsyncTCPTLS *)ctx;
+    AsyncSecureSession *sslctx = (AsyncSecureSession *)ctx;
     if (!sslctx || !sslctx->pcb()) {
         return MBEDTLS_ERR_NET_SEND_FAILED;
     }
@@ -1438,7 +1408,7 @@ static int _lwip_ssl_send(void *ctx, const unsigned char *buf, size_t len) {
 }
 
 static int _lwip_ssl_recv(void *ctx, unsigned char *buf, size_t len) {
-    AsyncTCPTLS *sslctx = (AsyncTCPTLS *)ctx;
+    AsyncSecureSession *sslctx = (AsyncSecureSession *)ctx;
     if (!sslctx || !sslctx->hasRxData()) {
         return MBEDTLS_ERR_SSL_WANT_READ;
     }
@@ -1447,13 +1417,13 @@ static int _lwip_ssl_recv(void *ctx, unsigned char *buf, size_t len) {
 
 #if MBEDTLS_VERSION_MAJOR >= 4
 // v4: RNG params removed — PSA Crypto provides the RNG internally.
-int AsyncTCPTLS::_parse_private_key(mbedtls_pk_context *pk,
+int AsyncSecureSession::_parse_private_key(mbedtls_pk_context *pk,
         const unsigned char *key, size_t keylen,
         const unsigned char *pwd, size_t pwdlen) {
     return mbedtls_pk_parse_key(pk, key, keylen, pwd, pwdlen);
 }
 #else
-int AsyncTCPTLS::_parse_private_key(mbedtls_pk_context *pk,
+int AsyncSecureSession::_parse_private_key(mbedtls_pk_context *pk,
         const unsigned char *key, size_t keylen,
         const unsigned char *pwd, size_t pwdlen) {
     return mbedtls_pk_parse_key(pk, key, keylen, pwd, pwdlen,
@@ -1462,16 +1432,16 @@ int AsyncTCPTLS::_parse_private_key(mbedtls_pk_context *pk,
 #endif
 
 /*
- * AsyncTCPTLS implementation
+ * AsyncSecureSession implementation
  */
 
 // Static shared RNG — initialized once, serialized on async task
 #if MBEDTLS_VERSION_MAJOR < 4
-mbedtls_ctr_drbg_context AsyncTCPTLS::drbg_ctx;
-mbedtls_entropy_context AsyncTCPTLS::entropy_ctx;
+mbedtls_ctr_drbg_context AsyncSecureSession::drbg_ctx;
+mbedtls_entropy_context AsyncSecureSession::entropy_ctx;
 #endif
-bool AsyncTCPTLS::_conf_initialized = false;
-int AsyncTCPTLS::_active_count = 0;
+bool AsyncSecureSession::_conf_initialized = false;
+int AsyncSecureSession::_active_count = 0;
 
 #if MBEDTLS_VERSION_MAJOR >= 4
 // Mbed TLS v4: PSA Crypto provides the RNG internally, so no app RNG is
@@ -1479,7 +1449,7 @@ int AsyncTCPTLS::_active_count = 0;
 #include <psa/crypto.h>
 #endif
 
-int AsyncTCPTLS::_rng_init(void) {
+int AsyncSecureSession::_rng_init(void) {
     if (_conf_initialized) return 0;
 #if MBEDTLS_VERSION_MAJOR >= 4
     psa_status_t ps = psa_crypto_init();
@@ -1496,19 +1466,19 @@ int AsyncTCPTLS::_rng_init(void) {
 }
 
 #if MBEDTLS_VERSION_MAJOR < 4
-void AsyncTCPTLS::_rng_seed_and_set(void) {
+void AsyncSecureSession::_rng_seed_and_set(void) {
     mbedtls_ctr_drbg_init(&drbg_ctx);
     mbedtls_entropy_init(&entropy_ctx);
     mbedtls_ctr_drbg_seed(&drbg_ctx, mbedtls_entropy_func,
-                          &entropy_ctx, (const unsigned char *)"AsyncTCPTLS", 11);
+                          &entropy_ctx, (const unsigned char *)"AsyncSecureSession", 18);
 }
 #endif
 
-AsyncTCPTLS::AsyncTCPTLS(void) {
+AsyncSecureSession::AsyncSecureSession(void) {
     mbedtls_ssl_init(&ssl_ctx);
     mbedtls_ssl_config_init(&ssl_conf);
     if (_rng_init() != 0) {
-        async_tcp_log_e("AsyncTCPTLS RNG init failed");
+        async_tcp_log_e("AsyncSecureSession RNG init failed");
     }
     _pcb = NULL;
     _ssl_key_password = NULL;
@@ -1522,14 +1492,16 @@ AsyncTCPTLS::AsyncTCPTLS(void) {
     _ssl_rx_buf_capacity = _ssl_rx_buf ? SSL_RX_BUF_SIZE : 0;
     _ssl_rx_buf_len = 0;
     _ssl_rx_pos = 0;
+    _pending_pbufs = NULL;
 
     _active_count++;
 }
 
-AsyncTCPTLS::~AsyncTCPTLS() {
+AsyncSecureSession::~AsyncSecureSession() {
+    if (_pending_pbufs) { pbuf_free(_pending_pbufs); _pending_pbufs = NULL; }
     _deleteHandshakeCerts();
 
-    async_tcp_log_v("~AsyncTCPTLS");
+    async_tcp_log_v("~AsyncSecureSession");
 
     mbedtls_ssl_free(&ssl_ctx);
     mbedtls_ssl_config_free(&ssl_conf);
@@ -1547,7 +1519,7 @@ AsyncTCPTLS::~AsyncTCPTLS() {
     _active_count--;
 }
 
-bool AsyncTCPTLS::feedRxData(const unsigned char *data, size_t len) {
+bool AsyncSecureSession::feedRxData(const unsigned char *data, size_t len) {
     if (!_ssl_rx_buf || len == 0) return true;
 
     // Only compact when there's not enough room at the tail
@@ -1580,7 +1552,41 @@ bool AsyncTCPTLS::feedRxData(const unsigned char *data, size_t len) {
     return true;
 }
 
-int AsyncTCPTLS::startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip) {
+// Feeds a fresh chain (or NULL to retry held bytes) into the BIO buffer.
+// Acks exactly the pbuf chain it consumed (drawn from lwIP's receive queue),
+// and chains any surplus (BIO cap hit) to _pending_pbufs for a later drain.
+// Returns the total count acked so the caller can close the lwIP window.
+// Runs on the lwIP thread or async task (serialized by core lock).
+size_t AsyncSecureSession::feedRx(pbuf *pb) {
+  size_t total_recved = 0;
+  pbuf *queue = pb;
+  if (!queue && !_pending_pbufs) {
+    return 0;
+  }
+  while (queue != NULL) {
+    if (!feedRxData((const unsigned char *)queue->payload, queue->len)) {
+      // BIO buffer full — hold remainder without acking (lwIP backpressures)
+      if (_pending_pbufs) {
+        pbuf_chain(_pending_pbufs, queue);
+      } else {
+        _pending_pbufs = queue;
+      }
+      break;
+    }
+    pbuf *b = queue;
+    queue = b->next;
+    b->next = NULL;
+    total_recved += b->len;
+    pbuf_free(b);
+    if (!queue && _pending_pbufs) {
+      queue = _pending_pbufs;
+      _pending_pbufs = NULL;
+    }
+  }
+  return total_recved;
+}
+
+int AsyncSecureSession::startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip) {
     return _startSSLClient(pcb, host_or_ip,
         NULL, 0,
         NULL, 0,
@@ -1588,7 +1594,7 @@ int AsyncTCPTLS::startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip) {
         NULL, NULL);
 }
 
-int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+int AsyncSecureSession::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const char *pskIdent, const char *psKey) {
     return _startSSLClient(pcb, host_or_ip,
         NULL, 0,
@@ -1597,7 +1603,7 @@ int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         pskIdent, psKey);
 }
 
-int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+int AsyncSecureSession::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const char *rootCABuff,
         const char *cli_cert,
         const char *cli_key,
@@ -1609,7 +1615,7 @@ int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         keyPassword);
 }
 
-int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+int AsyncSecureSession::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const unsigned char *rootCABuff, const size_t rootCABuff_len,
         const unsigned char *cli_cert, const size_t cli_cert_len,
         const unsigned char *cli_key, const size_t cli_key_len,
@@ -1622,7 +1628,7 @@ int AsyncTCPTLS::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         keyPassword);
 }
 
-int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
+int AsyncSecureSession::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         const unsigned char *rootCABuff, const size_t rootCABuff_len,
         const unsigned char *cli_cert, const size_t cli_cert_len,
         const unsigned char *cli_key, const size_t cli_key_len,
@@ -1771,7 +1777,7 @@ mbedtls_ssl_conf_own_cert(&ssl_conf, &client_cert, &client_key);
     return 0;
 }
 
-int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
+int AsyncSecureSession::startSSLServer(tcp_pcb *pcb,
         const unsigned char *server_cert, size_t server_cert_len,
         const unsigned char *server_key, size_t server_key_len,
         const char *password,
@@ -1936,7 +1942,7 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
     return 0;
 }
 
-int AsyncTCPTLS::runSSLHandshake(void) {
+int AsyncSecureSession::runSSLHandshake(void) {
     int ret, flags;
 
     if (!_pcb) return -1;
@@ -1977,7 +1983,7 @@ int AsyncTCPTLS::runSSLHandshake(void) {
     return 0;
 }
 
-int AsyncTCPTLS::write(const uint8_t *data, size_t len) {
+int AsyncSecureSession::write(const uint8_t *data, size_t len) {
     if (!_pcb) return -1;
 
     int ret = mbedtls_ssl_write(&ssl_ctx, data, len);
@@ -1987,13 +1993,12 @@ int AsyncTCPTLS::write(const uint8_t *data, size_t len) {
     return ret;
 }
 
-int AsyncTCPTLS::read(uint8_t *data, size_t len) {
+int AsyncSecureSession::read(uint8_t *data, size_t len) {
     if (!_ssl_rx_buf || _ssl_rx_pos >= _ssl_rx_buf_len) return 0;
     size_t avail = _ssl_rx_buf_len - _ssl_rx_pos;
     size_t copy = (avail < len) ? avail : len;
     memcpy(data, _ssl_rx_buf + _ssl_rx_pos, copy);
     _ssl_rx_pos += copy;
-    // Reset buffer when all consumed (TCP ack already done in _recv)
     if (_ssl_rx_pos >= _ssl_rx_buf_len) {
         _ssl_rx_buf_len = 0;
         _ssl_rx_pos = 0;
@@ -2001,7 +2006,7 @@ int AsyncTCPTLS::read(uint8_t *data, size_t len) {
     return (int)copy;
 }
 
-int AsyncTCPTLS::sslRead(uint8_t *data, size_t len) {
+int AsyncSecureSession::sslRead(uint8_t *data, size_t len) {
     if (!_pcb) return -1;
     int ret = mbedtls_ssl_read(&ssl_ctx, data, len);
     if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
@@ -2022,22 +2027,14 @@ int AsyncTCPTLS::sslRead(uint8_t *data, size_t len) {
     return ret;
 }
 
-void AsyncTCPTLS::logBioState(const char *tag) const {
+void AsyncSecureSession::logBioState(const char *tag) const {
     async_tcp_log_e("%s: rx_buf=%u/%u pos=%u rxBufLen=%u bytes_avail=%d",
         tag, (unsigned)_ssl_rx_buf_len, (unsigned)_ssl_rx_buf_capacity,
         (unsigned)_ssl_rx_pos, (unsigned)(_ssl_rx_buf_len - _ssl_rx_pos),
         (int)mbedtls_ssl_get_bytes_avail((mbedtls_ssl_context *)&ssl_ctx));
 }
 
-void AsyncTCPTLS::sendCloseNotify(void) {
-    if (!_pcb) return;
-    int ret = mbedtls_ssl_close_notify(&ssl_ctx);
-    if (ret != 0) {
-        async_tcp_log_d("close_notify: %d", ret);
-    }
-}
-
-void AsyncTCPTLS::_deleteHandshakeCerts(void) {
+void AsyncSecureSession::_deleteHandshakeCerts(void) {
     if (_have_ca_cert) {
         async_tcp_log_v("Cleaning CA certificate.");
         mbedtls_ssl_conf_ca_chain(&ssl_conf, NULL, NULL);
@@ -2058,5 +2055,5 @@ void AsyncTCPTLS::_deleteHandshakeCerts(void) {
 }
 
 #endif // ASYNC_TCP_SSL_ENABLED
-// ===== end mbedTLS/ESP32 AsyncTCPTLS.cpp =====
+// ===== end mbedTLS/ESP32 AsyncSecureSession.cpp =====
 #endif
