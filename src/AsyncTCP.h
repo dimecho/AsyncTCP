@@ -13,7 +13,7 @@
 #define ASYNCTCP_H_
 
 #include "AsyncTCPVersion.h"
-#include "AsyncTCPTLS.h"  // SSL, BearSSL_SSL_CTX, tcp_ssl_* decls (per-platform half)
+#include "AsyncTCPTLS.h"  // SSL/TLS
 #define ASYNCTCP_FORK_ESP32Async
 
 #ifdef ARDUINO
@@ -86,6 +86,7 @@ typedef std::function<void(void *, AsyncClient *, uint32_t time)> AcTimeoutHandl
 
 struct tcp_pcb;
 class AsyncTCP_detail;
+struct pending_pcb;
 
 #if defined(ESP8266)   // ---------------- ESP8266 + BearSSL -------------
 #if ASYNC_TCP_SSL_ENABLED
@@ -641,6 +642,7 @@ public:
       const unsigned char *clientCert = NULL, size_t clientCertLen = 0,
       const unsigned char *clientKey = NULL, size_t clientKeyLen = 0,
       const char *keyPassword = NULL);
+  bool startTLS(const char *host = "");
   bool ssl() const { return _ssl_ctx != 0; }
   void setSSLReceiveTimeout(uint32_t timeout) { _ssl_timeout = timeout; }
   uint32_t getSSLReceiveTimeout() const { return _ssl_timeout; }
@@ -706,6 +708,8 @@ protected:
   char *_ssl_key_password;
   void _clearSSLParams(void);
   pbuf *_ssl_pending_pbufs;
+  AcConnectHandler _server_discard_cb;   // set by AsyncServer to trigger instant slot promote
+  void *_server_discard_cb_arg;
 #endif
 };
 
@@ -759,10 +763,30 @@ protected:
   AcSSlFileHandler _ssl_file_cb;
   void *_ssl_file_cb_arg;
   const char *_ssl_key_password;
+
+  // Server-side session cache (TLS resumption), owned per instance, shared
+  // across this server's connections in startSSLServer().
+  // RAII: cache init'd in ctor, freed in dtor.
+  AsyncTCPTLSCache _ssl_session_cache;
+
+  // TLS admission queue: raw pcbs parked while the live serve budget
+  // (SSL_MAX_CONNECTIONS) is full. Oldest promotes on live-conn drop.
+  // Locking: all mutations on LwIP thread or under the lwIP core lock.
+  struct pending_pcb *_pending;
 #endif
 
   int8_t _accept(tcp_pcb *newpcb, int8_t err);
   int8_t _accepted(AsyncClient *client);
+  int8_t _serverAccept(tcp_pcb *pcb, struct pbuf *staged);
+  int8_t _s_poll(tcp_pcb *pcb);
+  int8_t _s_recv(tcp_pcb *pcb, struct pbuf *pb, int8_t err);
+  void _s_error(int8_t err);
+  int8_t _promoteSlot(void);
+  void _conn_done(AsyncClient *client);
+  static err_t _s_poll_cb(void *arg, tcp_pcb *tpcb);
+  static err_t _s_recv_cb(void *arg, tcp_pcb *tpcb, struct pbuf *pb, err_t err);
+  static void _s_error_cb(void *arg, err_t err);
+  static void _s_conn_done_cb(void *arg, AsyncClient *client);
 };
 #endif
 

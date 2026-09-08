@@ -7,14 +7,49 @@
 // Selected at compile time via #if defined(ESP8266). Only one stack compiles per target.
 #pragma once
 
-#if defined(ESP8266)
-// ===== begin BearSSL/ESP8266 AsyncTCPTLS.h (AsyncTCP) =====
-
-// --- SSL configuration ---
-// TLS glue is always compiled+linked when enabled; these flags gate it.
+// --- TLS configuration ---
 #ifndef ASYNC_TCP_SSL_ENABLED
 #define ASYNC_TCP_SSL_ENABLED 0
 #endif
+
+// --- Shared TLS config (admission/park/handshake; ESP8266/ESP32).
+#ifndef SSL_MAX_CONNECTIONS
+#define SSL_MAX_CONNECTIONS 2
+#endif
+
+#ifndef SSL_QUEUE_IDLE_MS
+#define SSL_QUEUE_IDLE_MS 20000
+#endif
+
+#ifndef SSL_PARKED_SLOTS
+#define SSL_PARKED_SLOTS 6
+#endif
+
+#ifndef SSL_PARKED_RX_CAP
+#define SSL_PARKED_RX_CAP 2000
+#endif
+
+#ifndef SSL_HANDSHAKE_TIMEOUT
+#define SSL_HANDSHAKE_TIMEOUT 10000
+#endif
+
+#ifndef SSL_SESSION_CACHE
+#define SSL_SESSION_CACHE 8
+#endif
+
+#ifndef SSL_CLIENT_MFLN
+#define SSL_CLIENT_MFLN 1024
+#endif
+
+// mbedTLS serve-floor: refuse a TLS serve when free heap is too low to build
+// the mbedTLS server context (ctor peak ~44-59KB). ESP8266 uses its own
+// BearSSL PRESSURE/PARK gates instead.
+#ifndef SSL_MBED_SERVE_FLOOR
+#define SSL_MBED_SERVE_FLOOR 90000
+#endif
+
+#if defined(ESP8266)
+// ===== begin BearSSL/ESP8266 AsyncTCPTLS.h (AsyncTCP) =====
 
 // Outbound TLS client role. 0 for a server-only HTTPS device: --gc-sections
 // strips the whole client crypto chain. Set 1 if you open connectSecure().
@@ -29,111 +64,90 @@
 #define ASYNC_TCP_SSL_ENABLE_SERVER 1
 #endif
 
-#ifndef TCP_SSL_HANDSHAKE_TIMEOUT
-#define TCP_SSL_HANDSHAKE_TIMEOUT 2000
-#endif
+#undef SSL_MAX_CONNECTIONS
+#define SSL_MAX_CONNECTIONS 1
 
-#ifndef TCP_SSL_FINGERPRINT_SIZE
-#define TCP_SSL_FINGERPRINT_SIZE 20
+#ifndef SSL_HANDSHAKE_TIMEOUT
+#define SSL_HANDSHAKE_TIMEOUT 2000
 #endif
 
 // Inbound I/O buffer. MUST fit the largest inbound TLS record: the browser's
 // ClientHello is ~1870 on the wire; 2048 covers it (MFLN caps everything else
 // at 1024+overhead).
-#ifndef ASYNC_TCP_SSL_IN_BUFFER_SIZE
-#define ASYNC_TCP_SSL_IN_BUFFER_SIZE 2048
+#ifndef SSL_IN_BUFFER_SIZE
+#define SSL_IN_BUFFER_SIZE 2048
+#endif
+
+#ifndef SSL_OUT_BUFFER_SIZE
+#define SSL_OUT_BUFFER_SIZE 1109
 #endif
 
 // Record-reassembly accumulator: must hold one full inbound record; too small
 // and the record tail drops, stalling the handshake forever. Sized to the IN
 // buffer so every record that fits IN also fits here.
-#ifndef ASYNC_TCP_SSL_ACCUM_BUFFER_SIZE
-#define ASYNC_TCP_SSL_ACCUM_BUFFER_SIZE 2048
-#endif
-
-// Ceiling for on-demand inbound-buffer growth (largest TLS record ~16.7KB).
-// Buffers start at IN_BUFFER_SIZE and grow only when a big record arrives.
-#ifndef ASYNC_TCP_SSL_MAX_IN_BUFFER_SIZE
-#define ASYNC_TCP_SSL_MAX_IN_BUFFER_SIZE 16768
-#endif
-
-#ifndef ASYNC_TCP_SSL_OUT_BUFFER_SIZE
-#define ASYNC_TCP_SSL_OUT_BUFFER_SIZE 1109
+#ifndef SSL_ACCUM_BUFFER_SIZE
+#define SSL_ACCUM_BUFFER_SIZE 2048
 #endif
 
 // Outbound record ring depth (K slots per conn live in the slab). K=2 doubles
 // pipelining but +1109B/slab starved this device's ~7.7K serve budget under
 // bursts (SENDREC hard-stall). K=1 measured stable.
-#ifndef ASYNC_TCP_SSL_RECORD_RING_SLOTS
-#define ASYNC_TCP_SSL_RECORD_RING_SLOTS 1
+#ifndef SSL_RECORD_RING_SLOTS
+#define SSL_RECORD_RING_SLOTS 1
 #endif
 
 // All per-conn buffers (inbuf + K-slot ring + accumulator) live in ONE slab so
 // the ctor needs one contiguous hole, not three allocs in a churned arena. The
 // SERVE_BLOCK admission bar then checks that single hole.
-#ifndef ASYNC_TCP_SSL_OUT_BUFFER_REGION
-#define ASYNC_TCP_SSL_OUT_BUFFER_REGION \
-  (ASYNC_TCP_SSL_RECORD_RING_SLOTS * ASYNC_TCP_SSL_OUT_BUFFER_SIZE)
+#ifndef SSL_OUT_BUFFER_REGION
+#define SSL_OUT_BUFFER_REGION \
+  (SSL_RECORD_RING_SLOTS * SSL_OUT_BUFFER_SIZE)
 #endif
-#ifndef ASYNC_TCP_SSL_BUFFER_SLAB
-#define ASYNC_TCP_SSL_BUFFER_SLAB \
-  (ASYNC_TCP_SSL_IN_BUFFER_SIZE + ASYNC_TCP_SSL_OUT_BUFFER_REGION + ASYNC_TCP_SSL_ACCUM_BUFFER_SIZE)
+#ifndef SSL_BUFFER_SLAB
+#define SSL_BUFFER_SLAB \
+  (SSL_IN_BUFFER_SIZE + SSL_OUT_BUFFER_REGION + SSL_ACCUM_BUFFER_SIZE)
 #endif
 
 // Cap outbound TLS records (plaintext) via server MFLN. Must not be below the
-// handshake Certificate flight size.
-#ifndef ASYNC_TCP_SSL_SERVER_MFLN
-#define ASYNC_TCP_SSL_SERVER_MFLN 1024
-#endif
+// handshake Certificate flight size. Re-sets the shared (4096) default: the
+// 1109B out-record ring + 2048B accumulator force 1024 here.
+#undef SSL_SERVER_MFLN
+#define SSL_SERVER_MFLN 1024
 
 // Offer MFLN from the outbound TLS client. Browsers never offer it; a server
 // that honors it also caps INBOUND records, which must stay <= accumulator.
-#ifndef ASYNC_TCP_SSL_CLIENT_MFLN
-#define ASYNC_TCP_SSL_CLIENT_MFLN 1024
-#endif
+#undef SSL_CLIENT_MFLN
+#define SSL_CLIENT_MFLN 1024
 
 // Force-close timeout for a serve with zero engine progress (e.g. send-pool
 // stall). Too low (5s) aborts healthy conns and crashes the arena; 20s lets
 // lwIP recovery drain the stall instead.
-#ifndef ASYNC_TCP_SSL_STALL_RESET_MS
-#define ASYNC_TCP_SSL_STALL_RESET_MS 20000
-#endif
-
-// Shed a parked slot that pins its RX pbufs this long while a live conn is up.
-// Must exceed the FIFO service time of the queued conns ahead of it.
-#ifndef ASYNC_TCP_SSL_QUEUE_IDLE_MS
-#define ASYNC_TCP_SSL_QUEUE_IDLE_MS 20000
+#ifndef SSL_STALL_RESET_MS
+#define SSL_STALL_RESET_MS 20000
 #endif
 
 // Minimum FREE HEAP to accept/park/promote a TLS conn. Below it, refuse (RST):
 // parked slots pin ~5.2KB each and a serve burns KBs mid-flight; a failed alloc
 // at ~4.5K free crashed the device. Free heap recovers to 13-17K between bursts,
 // so refusals are transient (browser retries). Contiguity is gated separately by
-// ASYNC_TCP_SSL_SERVE_BLOCK (== slab size, never 9000 — that latched).
-#ifndef ASYNC_TCP_SSL_PRESSURE_PARK_FLOOR
-#define ASYNC_TCP_SSL_PRESSURE_PARK_FLOOR 9000
+// SSL_SERVE_BLOCK (== slab size, never 9000 — that latched).
+#ifndef SSL_PRESSURE_PARK_FLOOR
+#define SSL_PRESSURE_PARK_FLOOR 9000
 #endif
 
 // Parked-conn queue depth. Each slot pins ~4KB (pcb + RX pbufs). 4 starved the
 // busy arena and froze the UI once (measured, pre-gate-rework); 2 absorbed a
 // page's parallel conns while leaving room for a queued promote. 3 = middle.
-#ifndef ASYNC_TCP_SSL_PARKED_SLOTS
-#define ASYNC_TCP_SSL_PARKED_SLOTS 3
+#ifndef SSL_PARKED_SLOTS
+#define SSL_PARKED_SLOTS 3
 #endif
 
 // Overflow-hold depth: when the park queue is full (or free heap is under the
 // floor), conns are HELD instead of RST'd — same pool-only buffering as a park
 // slot, admitted even in a tight arena. When both queues are full, the conn is
 // RST'd (true overload).
-#ifndef ASYNC_TCP_SSL_HOLD_LIMIT
-#define ASYNC_TCP_SSL_HOLD_LIMIT 4
-#endif
-
-// Max inbound bytes a PARKED conn may buffer before the excess stays in lwIP's
-// recv window. Must hold a full ClientHello (~1.9KB): the promoted handshake
-// needs the whole opening record staged (below it: handshake timeout).
-#ifndef ASYNC_TCP_SSL_PARKED_RX_CAP
-#define ASYNC_TCP_SSL_PARKED_RX_CAP 2000
+#ifndef SSL_HOLD_LIMIT
+#define SSL_HOLD_LIMIT 4
 #endif
 
 // Serve/promote admission. Two guards, checked in both _accept and _promoteSlot:
@@ -143,28 +157,21 @@
 // slab coalescing upward, the freed hole alone sits at ~slab+header (4190) and
 // reuse-in-place admits the next ctor; slab+margin (or 9000) deadlocks — it
 // refuses EVERY later conn while maxblock sits under it.
-#ifndef ASYNC_TCP_SSL_SERVE_BLOCK
-#define ASYNC_TCP_SSL_SERVE_BLOCK ASYNC_TCP_SSL_BUFFER_SLAB
+#ifndef SSL_SERVE_BLOCK
+#define SSL_SERVE_BLOCK SSL_BUFFER_SLAB
 #endif
 
 // Server-side session cache (TLS resumption). Each LRU entry = 100B static.
 // Resumption skips the Certificate flight, so each serve stages fewer bytes —
 // helps under parallel bursts. 2 entries = 200B.
-#ifndef ASYNC_TCP_SSL_SESSION_CACHE_ENTRIES
-#define ASYNC_TCP_SSL_SESSION_CACHE_ENTRIES 2
-#endif
-#ifndef ASYNC_TCP_SSL_SESSION_CACHE_ENTRY_SIZE
-#define ASYNC_TCP_SSL_SESSION_CACHE_ENTRY_SIZE 100
-#endif
-
-#ifndef ASYNC_TCP_SSL_X509_MODE
-// 0: secure (full cert validation)  1: insecure (skip validation)
-// 2: fingerprint (SHA1 match)      3: self-signed (issuer == subject)
-// 4: known key (public key match)
-#define ASYNC_TCP_SSL_X509_MODE 0
+#undef SSL_SESSION_CACHE
+#define SSL_SESSION_CACHE 2
+  
+#ifndef SSL_SESSION_CACHE_SIZE
+#define SSL_SESSION_CACHE_SIZE 100
 #endif
 
-const int ASYNC_TCP_SSL_MAX_FEED_LOOPS = 10;
+const int SSL_MAX_FEED_LOOPS = 10;
 
 #include <bearssl/bearssl.h>
 #include <bearssl/bearssl_ssl.h>
@@ -197,7 +204,7 @@ struct BearSSL_SSL_CTX {
 
   // Session cache (resumption); shared across conns. 100B per LRU entry.
   br_ssl_session_cache_lru session_cache;
-  unsigned char session_store[ASYNC_TCP_SSL_SESSION_CACHE_ENTRIES * ASYNC_TCP_SSL_SESSION_CACHE_ENTRY_SIZE];
+  unsigned char session_store[SSL_SESSION_CACHE * SSL_SESSION_CACHE_SIZE];
 #endif
 
   ~BearSSL_SSL_CTX();
@@ -240,7 +247,7 @@ struct tcp_ssl_pcb {
   // big hole instead of three.
   unsigned char* _slab;       // base of the contiguous buffer allocation
   unsigned char* inbuf;       // _slab + 0
-  unsigned char* outbuf;      // _slab + ASYNC_TCP_SSL_IN_BUFFER_SIZE
+  unsigned char* outbuf;      // _slab + SSL_IN_BUFFER_SIZE
   size_t inbuf_cap;           // current allocated size of the inbuf region
   size_t recvrec_accum_cap;   // current allocated size of recvrec_accum region
 
@@ -270,8 +277,8 @@ struct tcp_ssl_pcb {
   // frees the engine outbuf immediately, so the NEXT record builds into it.
   // Handshake flights ride the same ring (keeps them out of heap). Slots free
   // FIFO in tcp_ssl_sent() as ciphertext ACKs land.
-  unsigned char* out_ring[ASYNC_TCP_SSL_RECORD_RING_SLOTS];      // outbuf + i*OUT_BUFFER_SIZE
-  uint16_t       out_ring_len[ASYNC_TCP_SSL_RECORD_RING_SLOTS];  // ciphertext bytes in each slot
+  unsigned char* out_ring[SSL_RECORD_RING_SLOTS];      // outbuf + i*OUT_BUFFER_SIZE
+  uint16_t       out_ring_len[SSL_RECORD_RING_SLOTS];  // ciphertext bytes in each slot
   uint8_t        out_ring_next;    // next slot to fill (write cursor)
   uint8_t        out_ring_pinned;  // slots currently referencing un-ACKed records
   uint32_t       out_ring_acked;   // CUMULATIVE ciphertext ACKed against the ring (see tcp_ssl_sent);
@@ -372,7 +379,6 @@ uint8_t tcp_ssl_parked_count();
 // Diagnostics for the SETTLED log.
 unsigned long tcp_ssl_serve_conns_total();
 void tcp_ssl_shed_parked();  // flush the parked queue at the next idle tick
-void tcp_ssl_pcb_pressure(unsigned *active, unsigned *tw);
 int tcp_ssl_live_serve_shells();  // live AsyncClient shells (leak finder)
 #endif
 
@@ -406,13 +412,13 @@ void br_x509_insecure_init(x509_insecure_context* ctx, bool use_fingerprint, con
 #ifndef MBEDTLS_VERSION_MAJOR
 #define MBEDTLS_VERSION_MAJOR 3
 #endif
-#define ASYNCTCP_MBEDTLS_MAJOR MBEDTLS_VERSION_MAJOR
 // -------------------------------------------------------------------------
 
 #include "mbedtls/platform.h"
 #include "mbedtls/debug.h"
 #include "mbedtls/ssl.h"
-#if ASYNCTCP_MBEDTLS_MAJOR < 4
+#include "mbedtls/ssl_cache.h"
+#if MBEDTLS_VERSION_MAJOR < 4
 #include "mbedtls/entropy.h"
 #include "mbedtls/ctr_drbg.h"
 #endif
@@ -424,16 +430,28 @@ struct tcp_pcb;
 #define ASYNCTCP_TLS_CAN_RETRY(r)   (((r) == MBEDTLS_ERR_SSL_WANT_READ) || ((r) == MBEDTLS_ERR_SSL_WANT_WRITE))
 #define ASYNCTCP_TLS_EOF(r)         (((r) == MBEDTLS_ERR_SSL_CONN_EOF) || ((r) == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY))
 
-#define ASYNCTCP_TLS_RX_BUF_SIZE    4096
-#define ASYNCTCP_TLS_RX_BUF_MAX     8192
+#define SSL_RX_BUF_SIZE    4096
+#define SSL_RX_BUF_MAX     8192
 
-#ifndef SSL_HANDSHAKE_TIMEOUT
-#define SSL_HANDSHAKE_TIMEOUT 10000
-#endif
+// Uniquely-owned, RAII server-side TLS session cache. One per AsyncServer.
+// Not copyable. Pass .context() to startSSLServer().
+class AsyncTCPTLSCache
+{
+public:
+    AsyncTCPTLSCache()
+    {
+        mbedtls_ssl_cache_init(&_ctx);
+        mbedtls_ssl_cache_set_max_entries(&_ctx, SSL_SESSION_CACHE);
+        mbedtls_ssl_cache_set_timeout(&_ctx, 0);
+    }
+    ~AsyncTCPTLSCache() { mbedtls_ssl_cache_free(&_ctx); }
+    mbedtls_ssl_cache_context *context() { return &_ctx; }
+    AsyncTCPTLSCache(const AsyncTCPTLSCache &) = delete;
+    AsyncTCPTLSCache &operator=(const AsyncTCPTLSCache &) = delete;
 
-#ifndef SSL_MAX_CONNECTIONS
-#define SSL_MAX_CONNECTIONS 4
-#endif
+private:
+    mbedtls_ssl_cache_context _ctx;
+};
 
 class AsyncTCPTLS
 {
@@ -443,14 +461,14 @@ private:
 
     // Shared RNG — initialized once, serialized on async task.
     // v3: legacy entropy + CTR-DRBG. v4: PSA Crypto (no DRBG types).
-#if ASYNCTCP_MBEDTLS_MAJOR < 4
+#if MBEDTLS_VERSION_MAJOR < 4
     static mbedtls_ctr_drbg_context drbg_ctx;
     static mbedtls_entropy_context entropy_ctx;
 #endif
     static bool _conf_initialized;
 
     static int _rng_init(void);
-#if ASYNCTCP_MBEDTLS_MAJOR < 4
+#if MBEDTLS_VERSION_MAJOR < 4
     static void _rng_seed_and_set(void);
 #endif
     // Parse a PEM/DER private key. v3 supplies the legacy RNG; v4 uses PSA.
@@ -532,7 +550,8 @@ public:
     int startSSLServer(tcp_pcb *pcb,
         const unsigned char *server_cert, size_t server_cert_len,
         const unsigned char *server_key, size_t server_key_len,
-        const char *password = NULL);
+        const char *password = NULL,
+        mbedtls_ssl_cache_context *session_cache = NULL);
 
     int runSSLHandshake(void);
 

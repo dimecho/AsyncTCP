@@ -91,26 +91,6 @@ BearSSL_SSL_CTX::~BearSSL_SSL_CTX() {
 // Linked list of all active BearSSL connections
 tcp_ssl_pcb* tcp_ssl_pcbs = nullptr;
 
-// lwIP TCP-PCB pool diagnostics. A burst of graceful closes parks each
-// connection's pcb in TIME_WAIT for 2*MSL (~120s); with the ESP8266's small
-// MEMP_NUM_TCP_PCB pool that exhausts after ~2 bursts and new SYNs are
-// silently dropped INSIDE lwIP (our accept callback never fires). Counting the
-// chain heads tells heap-pressure (SETTLED free low) apart from pcb-pressure
-// (active+tw near pool limit) at the exact stuck moment.
-static void lwip_pcb_counts(unsigned *active, unsigned *tw) {
-  extern struct tcp_pcb *tcp_active_pcbs;
-  extern struct tcp_pcb *tcp_tw_pcbs;
-  unsigned a = 0, t = 0;
-  for (struct tcp_pcb *it = tcp_active_pcbs; it; it = (struct tcp_pcb *)it->next) a++;
-  for (struct tcp_pcb *it = tcp_tw_pcbs; it; it = (struct tcp_pcb *)it->next) t++;
-  *active = a;
-  *tw = t;
-}
-
-void tcp_ssl_pcb_pressure(unsigned *active, unsigned *tw) {
-  lwip_pcb_counts(active, tw);
-}
-
 // Helper to find an SSL connection's state from its lwIP pcb
 tcp_ssl_pcb* find_ssl_pcb(struct tcp_pcb* pcb) {
   tcp_ssl_pcb* iter = tcp_ssl_pcbs;
@@ -165,25 +145,25 @@ tcp_ssl_pcb* tcp_ssl_alloc_pcb(struct tcp_pcb* pcb, bool is_server) {
   // ONE contiguous allocation for inbuf + record ring + accumulator. A single
   // ~4.5KB slab needs one big heap hole instead of three separate allocs, so
   // the admission BLOCK bar can guarantee the whole conn fits in one piece.
-  ssl_pcb->recvrec_accum_cap = ASYNC_TCP_SSL_ACCUM_BUFFER_SIZE;
-  ssl_pcb->inbuf_cap = ASYNC_TCP_SSL_IN_BUFFER_SIZE;
-  ssl_pcb->_slab = new (std::nothrow) unsigned char[ASYNC_TCP_SSL_BUFFER_SLAB];
+  ssl_pcb->recvrec_accum_cap = SSL_ACCUM_BUFFER_SIZE;
+  ssl_pcb->inbuf_cap = SSL_IN_BUFFER_SIZE;
+  ssl_pcb->_slab = new (std::nothrow) unsigned char[SSL_BUFFER_SLAB];
   if (!ssl_pcb->_slab) {
     async_tcp_log_d("ALLOC FAIL: free heap=%u, need slab=%u (rank=%u)\n",
-                    (unsigned)ESP.getFreeHeap(), (unsigned)ASYNC_TCP_SSL_BUFFER_SLAB,
+                    (unsigned)ESP.getFreeHeap(), (unsigned)SSL_BUFFER_SLAB,
                     (unsigned)(is_server ? 2 : 1));
     delete ssl_pcb;
     return nullptr;
   }
   ssl_pcb->inbuf = ssl_pcb->_slab;
-  ssl_pcb->outbuf = ssl_pcb->_slab + ASYNC_TCP_SSL_IN_BUFFER_SIZE;
-  ssl_pcb->recvrec_accum = ssl_pcb->_slab + ASYNC_TCP_SSL_IN_BUFFER_SIZE + ASYNC_TCP_SSL_OUT_BUFFER_REGION;
-  for (uint8_t i = 0; i < ASYNC_TCP_SSL_RECORD_RING_SLOTS; i++) {
-    ssl_pcb->out_ring[i] = ssl_pcb->outbuf + i * ASYNC_TCP_SSL_OUT_BUFFER_SIZE;
+  ssl_pcb->outbuf = ssl_pcb->_slab + SSL_IN_BUFFER_SIZE;
+  ssl_pcb->recvrec_accum = ssl_pcb->_slab + SSL_IN_BUFFER_SIZE + SSL_OUT_BUFFER_REGION;
+  for (uint8_t i = 0; i < SSL_RECORD_RING_SLOTS; i++) {
+    ssl_pcb->out_ring[i] = ssl_pcb->outbuf + i * SSL_OUT_BUFFER_SIZE;
     ssl_pcb->out_ring_len[i] = 0;
   }
   async_tcp_log_d("ALLOC: free heap=%u rank=%u slab=%u\n", (unsigned)ESP.getFreeHeap(),
-                  (unsigned)(is_server ? 2 : 1), (unsigned)ASYNC_TCP_SSL_BUFFER_SLAB);
+                  (unsigned)(is_server ? 2 : 1), (unsigned)SSL_BUFFER_SLAB);
   return ssl_pcb;
 }
 
@@ -326,18 +306,13 @@ int tcp_ssl_free(struct tcp_pcb* pcb) {
       delete iter;
       async_tcp_log_d("FREE: free heap=%u\n", (unsigned)ESP.getFreeHeap());
       if (!tcp_ssl_pcbs) {
-        // All TLS conns drained: print the true idle floor + lwIP pcb-pressure,
-        // then ask the server to flush its parked queue (parked pcbs pin the
-        // previous page's pbuf chains and can hold free heap below the bar).
-        // Compare SETTLED free across bursts (heap leak) vs tw-count climbing
-        // toward the MEMP pool (pcb exhaustion -> 3rd-burst drop).
-        unsigned active = 0, tw = 0;
-        lwip_pcb_counts(&active, &tw);
-        async_tcp_log_i("SETTLED: conns=%lu, parked=%u, free heap=%u, maxblock=%u, frag=%u%%, shells=%d, active=%u, tw=%u\n",
+        // All TLS conns drained: print the true idle floor, then ask the server
+        // to flush its parked queue (parked pcbs pin the previous page's pbuf
+        // chains and can hold free heap below the bar).
+        async_tcp_log_i("SETTLED: conns=%lu, parked=%u, free heap=%u, maxblock=%u, frag=%u%%, shells=%d\n",
                         tcp_ssl_serve_conns_total(), tcp_ssl_parked_count(),
                         (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize(),
-                        (unsigned)ESP.getHeapFragmentation(), tcp_ssl_live_serve_shells(),
-                        active, tw);
+                        (unsigned)ESP.getHeapFragmentation(), tcp_ssl_live_serve_shells());
         tcp_ssl_shed_parked();
       }
       return 0;
@@ -371,7 +346,7 @@ size_t tcp_ssl_close(struct tcp_pcb* pcb) {
     br_ssl_engine_flush(eng, 0);
     size_t plen = 0;
     unsigned char* pbuf = br_ssl_engine_sendrec_buf(eng, &plen);
-    if (pbuf && plen && plen <= ASYNC_TCP_SSL_OUT_BUFFER_SIZE) {
+    if (pbuf && plen && plen <= SSL_OUT_BUFFER_SIZE) {
       if (tcp_write(pcb, pbuf, plen, TCP_WRITE_FLAG_COPY) != ERR_OK) {
         return pcb_written;  // record still pending — leave it (best effort)
       }
@@ -386,7 +361,7 @@ size_t tcp_ssl_close(struct tcp_pcb* pcb) {
   if (ssl_pcb->sendrec_deferred && (br_ssl_engine_current_state(eng) & BR_SSL_SENDREC)) {
     size_t plen = 0;
     unsigned char* pbuf = br_ssl_engine_sendrec_buf(eng, &plen);
-    if (pbuf && plen && plen <= ASYNC_TCP_SSL_OUT_BUFFER_SIZE) {
+    if (pbuf && plen && plen <= SSL_OUT_BUFFER_SIZE) {
       if (tcp_write(pcb, pbuf, plen, TCP_WRITE_FLAG_COPY) != ERR_OK) {
         return pcb_written;
       }
@@ -400,7 +375,7 @@ size_t tcp_ssl_close(struct tcp_pcb* pcb) {
   br_ssl_engine_close(eng);
   size_t len = 0;
   unsigned char* buf = br_ssl_engine_sendrec_buf(eng, &len);
-  if (!buf || len == 0 || len > ASYNC_TCP_SSL_OUT_BUFFER_SIZE) return pcb_written;
+  if (!buf || len == 0 || len > SSL_OUT_BUFFER_SIZE) return pcb_written;
   if (tcp_write(pcb, buf, len, TCP_WRITE_FLAG_COPY) != ERR_OK) return pcb_written;
   br_ssl_engine_sendrec_ack(eng, len);
   pcb_written += len;
@@ -494,7 +469,7 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
   // --- Process BearSSL engine state machine ---
   uint32_t state = br_ssl_engine_current_state(eng);
 
-  for (int i = 0; i < ASYNC_TCP_SSL_MAX_FEED_LOOPS; i++) {
+  for (int i = 0; i < SSL_MAX_FEED_LOOPS; i++) {
     yield();  // Feed WDT — BearSSL handshake can take many iterations
     if (!tcp_ssl_pcb_is_alive(ssl_pcb)) return;  // freed while yielding
     state = br_ssl_engine_current_state(eng);
@@ -546,7 +521,7 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
 
     if (state & BR_SSL_RECVAPP) {
       ssl_pcb->in_buf_ptr = br_ssl_engine_recvapp_buf(eng, &(ssl_pcb->in_len));
-      if (ssl_pcb->in_len && ssl_pcb->in_len < ASYNC_TCP_SSL_IN_BUFFER_SIZE) {
+      if (ssl_pcb->in_len && ssl_pcb->in_len < SSL_IN_BUFFER_SIZE) {
         br_ssl_engine_recvapp_ack(eng, ssl_pcb->in_len);
         if (ssl_pcb->on_data) {
           ssl_pcb->on_data(ssl_pcb->arg, ssl_pcb->tcp, ssl_pcb->in_buf_ptr, ssl_pcb->in_len);
@@ -569,12 +544,12 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
     // (largest-block ~176B vs a ~1KB flight record) — the SENDREC hard-stall
     // that wedged all browser loads. No app data exists mid-handshake, so the
     // single ring slot is always available to handshake flights.
-    if (ssl_pcb->out_ring_pinned >= ASYNC_TCP_SSL_RECORD_RING_SLOTS) {
+    if (ssl_pcb->out_ring_pinned >= SSL_RECORD_RING_SLOTS) {
       break;  // ring full — wait for ACK; tcp_ssl_sent re-arms if SENDREC is set
     }
 
     ssl_pcb->out_buf_ptr = br_ssl_engine_sendrec_buf(eng, &(ssl_pcb->out_len));
-    if (ssl_pcb->out_len && ssl_pcb->out_len <= ASYNC_TCP_SSL_OUT_BUFFER_SIZE) {
+    if (ssl_pcb->out_len && ssl_pcb->out_len <= SSL_OUT_BUFFER_SIZE) {
       // lwIP gates tcp_write on BOTH the byte window (snd_buf) and the pbuf
       // queue depth (snd_queuelen vs TCP_SND_QUEUELEN). The sndbuf boost sets
       // only snd_buf (8*TCP_MSS), NOT TCP_SND_QUEUELEN, so a burst of records
@@ -600,7 +575,7 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
           werr = tcp_write(ssl_pcb->tcp, ssl_pcb->out_ring[slot], ssl_pcb->out_len, 0);
           if (werr == ERR_OK) {
             ssl_pcb->out_ring_len[slot] = ssl_pcb->out_len;
-            ssl_pcb->out_ring_next = (uint8_t)((slot + 1) % ASYNC_TCP_SSL_RECORD_RING_SLOTS);
+            ssl_pcb->out_ring_next = (uint8_t)((slot + 1) % SSL_RECORD_RING_SLOTS);
             ssl_pcb->out_ring_pinned++;
           }
         }
@@ -676,7 +651,7 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
   // is set) or while the record ring is full (out_ring_pinned == K — we wait
   // for the ACKs in tcp_ssl_sent to open slots), either of which would busy-loop.
   if (ssl_pcb->sendrec_deferred == false &&
-      ssl_pcb->out_ring_pinned < ASYNC_TCP_SSL_RECORD_RING_SLOTS) {
+      ssl_pcb->out_ring_pinned < SSL_RECORD_RING_SLOTS) {
     state = br_ssl_engine_current_state(eng);
     if (state & BR_SSL_SENDREC) {
       schedule_ssl_engine(ssl_pcb);
@@ -725,7 +700,7 @@ void tcp_ssl_sent(struct tcp_pcb* pcb, size_t acked) {
   ssl_pcb->out_ring_acked += (uint32_t)acked;
   while (ssl_pcb->out_ring_pinned > 0) {
     uint8_t oldest = (uint8_t)((ssl_pcb->out_ring_next - ssl_pcb->out_ring_pinned +
-                                ASYNC_TCP_SSL_RECORD_RING_SLOTS) % ASYNC_TCP_SSL_RECORD_RING_SLOTS);
+                                SSL_RECORD_RING_SLOTS) % SSL_RECORD_RING_SLOTS);
     if (ssl_pcb->out_ring_acked >= ssl_pcb->out_ring_len[oldest]) {
       ssl_pcb->out_ring_acked -= ssl_pcb->out_ring_len[oldest];
       ssl_pcb->out_ring_len[oldest] = 0;
@@ -817,7 +792,7 @@ int tcp_ssl_read(struct tcp_pcb* pcb, struct pbuf* pb) {
   size_t pb_offset = 0;
 
   while (remaining > 0) {
-    size_t accum_space = ASYNC_TCP_SSL_ACCUM_BUFFER_SIZE - ssl_pcb->recvrec_accum_len;
+    size_t accum_space = SSL_ACCUM_BUFFER_SIZE - ssl_pcb->recvrec_accum_len;
     if (accum_space == 0) {
       // Accumulator full — schedule engine to drain, then retry
       schedule_ssl_engine(ssl_pcb);
@@ -1081,10 +1056,10 @@ int tcp_ssl_new_client(struct tcp_pcb* pcb, const char* host, const br_x509_clas
 
   br_ssl_client_base_init(ssl_pcb->sc_client, suites_P, sizeof(suites_P) / sizeof(suites_P[0]));
 
-#if ASYNC_TCP_SSL_CLIENT_MFLN
+#if SSL_CLIENT_MFLN
   // Offer max_fragment_length (RFC 6066) to the mail server; must precede
   // br_ssl_client_reset (handshake start).
-  br_ssl_engine_new_max_frag_len(&ssl_pcb->sc_client->eng, ASYNC_TCP_SSL_CLIENT_MFLN);
+  br_ssl_engine_new_max_frag_len(&ssl_pcb->sc_client->eng, SSL_CLIENT_MFLN);
 #endif
 
   // Install x509 validator. When the caller supplies none (rootCA == NULL),
@@ -1102,8 +1077,8 @@ int tcp_ssl_new_client(struct tcp_pcb* pcb, const char* host, const br_x509_clas
 
   br_ssl_engine_set_x509(&ssl_pcb->sc_client->eng, x509ctx);
 
-  br_ssl_engine_set_buffers_bidi(&ssl_pcb->sc_client->eng, ssl_pcb->inbuf, ASYNC_TCP_SSL_IN_BUFFER_SIZE,
-                                 ssl_pcb->outbuf, ASYNC_TCP_SSL_OUT_BUFFER_SIZE);
+  br_ssl_engine_set_buffers_bidi(&ssl_pcb->sc_client->eng, ssl_pcb->inbuf, SSL_IN_BUFFER_SIZE,
+                                 ssl_pcb->outbuf, SSL_OUT_BUFFER_SIZE);
   br_ssl_engine_set_versions(&ssl_pcb->sc_client->eng, BR_TLS12, BR_TLS12);
 
   // Set server name for SNI (required for TLS 1.2+)
@@ -1307,8 +1282,8 @@ int tcp_ssl_new_server(struct tcp_pcb* pcb, BearSSL_SSL_CTX* ssl_ctx) {
   // No heap allocated here, so "TLS init failed" churn can't happen.
   ssl_pcb->sc_server = &ssl_ctx->server_ctx;
 
-  br_ssl_engine_set_buffers_bidi(&ssl_pcb->sc_server->eng, ssl_pcb->inbuf, ASYNC_TCP_SSL_IN_BUFFER_SIZE,
-                                 ssl_pcb->outbuf, ASYNC_TCP_SSL_OUT_BUFFER_SIZE);
+  br_ssl_engine_set_buffers_bidi(&ssl_pcb->sc_server->eng, ssl_pcb->inbuf, SSL_IN_BUFFER_SIZE,
+                                 ssl_pcb->outbuf, SSL_OUT_BUFFER_SIZE);
 
   if (!br_ssl_server_reset(ssl_pcb->sc_server)) {
     delete ssl_pcb;
@@ -1318,8 +1293,8 @@ int tcp_ssl_new_server(struct tcp_pcb* pcb, BearSSL_SSL_CTX* ssl_ctx) {
   // Force MFLN (RFC 6066 max_fragment_length) = 1024 on the server.
   // Per br_ssl_engine_new_max_frag_len(), this caps every outbound record's
   // plaintext (including the handshake Certificate flight) at 1024 bytes.
-#if ASYNC_TCP_SSL_SERVER_MFLN && ASYNC_TCP_SSL_SERVER_MFLN != 0
-  br_ssl_engine_new_max_frag_len(&ssl_pcb->sc_server->eng, ASYNC_TCP_SSL_SERVER_MFLN);
+#if SSL_SERVER_MFLN && SSL_SERVER_MFLN != 0
+  br_ssl_engine_new_max_frag_len(&ssl_pcb->sc_server->eng, SSL_SERVER_MFLN);
 #endif
 
   tcp_ssl_register_pcb(ssl_pcb);
@@ -1369,6 +1344,20 @@ extern "C" {
 // From mbedtls/net_sockets.h — not included since we use custom LwIP BIO
 #ifndef MBEDTLS_ERR_NET_SEND_FAILED
 #define MBEDTLS_ERR_NET_SEND_FAILED -0x004E
+#endif
+
+#if defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
+// Map a desired max-fragment len (bytes) to the mbedTLS MFLN extension code.
+// Only the RFC 6066 sizes are expressible; anything else disables the ext.
+static unsigned char _ssl_mfln_code(unsigned len) {
+    switch (len) {
+        case 512:  return MBEDTLS_SSL_MAX_FRAG_LEN_512;
+        case 1024: return MBEDTLS_SSL_MAX_FRAG_LEN_1024;
+        case 2048: return MBEDTLS_SSL_MAX_FRAG_LEN_2048;
+        case 4096: return MBEDTLS_SSL_MAX_FRAG_LEN_4096;
+        default:   return MBEDTLS_SSL_MAX_FRAG_LEN_NONE;
+    }
+}
 #endif
 
 static int _handle_error(int err) {
@@ -1456,7 +1445,7 @@ static int _lwip_ssl_recv(void *ctx, unsigned char *buf, size_t len) {
     return sslctx->read(buf, len);
 }
 
-#if ASYNCTCP_MBEDTLS_MAJOR >= 4
+#if MBEDTLS_VERSION_MAJOR >= 4
 // v4: RNG params removed — PSA Crypto provides the RNG internally.
 int AsyncTCPTLS::_parse_private_key(mbedtls_pk_context *pk,
         const unsigned char *key, size_t keylen,
@@ -1477,14 +1466,14 @@ int AsyncTCPTLS::_parse_private_key(mbedtls_pk_context *pk,
  */
 
 // Static shared RNG — initialized once, serialized on async task
-#if ASYNCTCP_MBEDTLS_MAJOR < 4
+#if MBEDTLS_VERSION_MAJOR < 4
 mbedtls_ctr_drbg_context AsyncTCPTLS::drbg_ctx;
 mbedtls_entropy_context AsyncTCPTLS::entropy_ctx;
 #endif
 bool AsyncTCPTLS::_conf_initialized = false;
 int AsyncTCPTLS::_active_count = 0;
 
-#if ASYNCTCP_MBEDTLS_MAJOR >= 4
+#if MBEDTLS_VERSION_MAJOR >= 4
 // Mbed TLS v4: PSA Crypto provides the RNG internally, so no app RNG is
 // needed. We only have to ensure PSA is initialised (see _rng_init).
 #include <psa/crypto.h>
@@ -1492,7 +1481,7 @@ int AsyncTCPTLS::_active_count = 0;
 
 int AsyncTCPTLS::_rng_init(void) {
     if (_conf_initialized) return 0;
-#if ASYNCTCP_MBEDTLS_MAJOR >= 4
+#if MBEDTLS_VERSION_MAJOR >= 4
     psa_status_t ps = psa_crypto_init();
     if (ps != PSA_SUCCESS) {
         async_tcp_log_e("psa_crypto_init failed: %d", (int)ps);
@@ -1506,7 +1495,7 @@ int AsyncTCPTLS::_rng_init(void) {
     return 0;
 }
 
-#if ASYNCTCP_MBEDTLS_MAJOR < 4
+#if MBEDTLS_VERSION_MAJOR < 4
 void AsyncTCPTLS::_rng_seed_and_set(void) {
     mbedtls_ctr_drbg_init(&drbg_ctx);
     mbedtls_entropy_init(&entropy_ctx);
@@ -1529,8 +1518,8 @@ AsyncTCPTLS::AsyncTCPTLS(void) {
     handshake_timeout = SSL_HANDSHAKE_TIMEOUT;
     handshake_start_time = 0;
 
-    _ssl_rx_buf = (unsigned char *)malloc(ASYNCTCP_TLS_RX_BUF_SIZE);
-    _ssl_rx_buf_capacity = _ssl_rx_buf ? ASYNCTCP_TLS_RX_BUF_SIZE : 0;
+    _ssl_rx_buf = (unsigned char *)malloc(SSL_RX_BUF_SIZE);
+    _ssl_rx_buf_capacity = _ssl_rx_buf ? SSL_RX_BUF_SIZE : 0;
     _ssl_rx_buf_len = 0;
     _ssl_rx_pos = 0;
 
@@ -1574,7 +1563,7 @@ bool AsyncTCPTLS::feedRxData(const unsigned char *data, size_t len) {
     }
 
     // Check hard cap — if exceeded, caller must hold the pbuf
-    if (_ssl_rx_buf_len + len > ASYNCTCP_TLS_RX_BUF_MAX) {
+    if (_ssl_rx_buf_len + len > SSL_RX_BUF_MAX) {
         return false;
     }
 
@@ -1663,9 +1652,10 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
     mbedtls_ssl_conf_renegotiation(&ssl_conf, MBEDTLS_SSL_RENEGOTIATION_DISABLED);
 #endif
 
-    // Pin fast cipher suite — hardware-accelerated AES-GCM + SHA256 on ESP32
+    // Pin fast cipher suites — hardware-accelerated AES-GCM + SHA256 (RSA/ECDSA)
     static const int client_ciphersuites[] = {
         MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
         0
     };
     mbedtls_ssl_conf_ciphersuites(&ssl_conf, client_ciphersuites);
@@ -1745,7 +1735,7 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
             return handle_error(ret);
         }
 
-        mbedtls_ssl_conf_own_cert(&ssl_conf, &client_cert, &client_key);
+mbedtls_ssl_conf_own_cert(&ssl_conf, &client_cert, &client_key);
     }
 
     async_tcp_log_v("Setting hostname for TLS session...");
@@ -1759,13 +1749,13 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         return handle_error(ret);
     }
 
-#if ASYNCTCP_MBEDTLS_MAJOR < 4
+#if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_ssl_conf_rng(&ssl_conf, mbedtls_ctr_drbg_random, &drbg_ctx);
 #endif
 
-    // Reduce buffer sizes to fit ESP32 heap (requires MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
+    // Negotiate the MFLN extension (RFC 6066); requires MBEDTLS_SSL_MAX_FRAGMENT_LENGTH
 #if defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
-    mbedtls_ssl_conf_max_frag_len(&ssl_conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096);
+    mbedtls_ssl_conf_max_frag_len(&ssl_conf, _ssl_mfln_code(SSL_CLIENT_MFLN));
 #endif
 
     if ((ret = mbedtls_ssl_setup(&ssl_ctx, &ssl_conf)) != 0) {
@@ -1784,8 +1774,11 @@ int AsyncTCPTLS::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
 int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
         const unsigned char *server_cert, size_t server_cert_len,
         const unsigned char *server_key, size_t server_key_len,
-        const char *password) {
+        const char *password,
+        mbedtls_ssl_cache_context *session_cache) {
     int ret;
+
+    async_tcp_log_d("startSSLServer: free heap %u B", (unsigned)ESP.getFreeHeap());
 
     if (server_cert == NULL || server_key == NULL || !pcb) {
         return -1;
@@ -1814,9 +1807,10 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
     mbedtls_ssl_conf_renegotiation(&ssl_conf, MBEDTLS_SSL_RENEGOTIATION_DISABLED);
 #endif
 
-    // Pin fast cipher suite — hardware-accelerated AES-GCM + SHA256 on ESP32
+    // Pin fast cipher suites — hardware-accelerated AES-GCM + SHA256 (RSA/ECDSA)
     static const int server_ciphersuites[] = {
         MBEDTLS_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        MBEDTLS_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
         0
     };
     mbedtls_ssl_conf_ciphersuites(&ssl_conf, server_ciphersuites);
@@ -1881,23 +1875,26 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
         const unsigned char *pwd = (const unsigned char *)_ssl_key_password;
         size_t pwd_len = _ssl_key_password ? strlen(_ssl_key_password) : 0;
 
-        const char *key_header, *key_footer;
-        if (strncmp(pem_buf, "-----BEGIN ENCRYPTED PRIVATE KEY-----", 37) == 0) {
-            key_header = "-----BEGIN ENCRYPTED PRIVATE KEY-----";
-            key_footer = "-----END ENCRYPTED PRIVATE KEY-----";
-        } else if (strncmp(pem_buf, "-----BEGIN PRIVATE KEY-----", 27) == 0) {
-            key_header = "-----BEGIN PRIVATE KEY-----";
-            key_footer = "-----END PRIVATE KEY-----";
-        } else {
-            key_header = "-----BEGIN RSA PRIVATE KEY-----";
-            key_footer = "-----END RSA PRIVATE KEY-----";
-        }
-        ret = mbedtls_pem_read_buffer(&pem, key_header, key_footer,
-            (const unsigned char *)pem_buf, pwd, pwd_len, &use_len);
-        if (ret == 0) {
+        static const char *const key_markers[][2] = {
+            { "-----BEGIN EC PRIVATE KEY-----",     "-----END EC PRIVATE KEY-----" },
+            { "-----BEGIN RSA PRIVATE KEY-----",    "-----END RSA PRIVATE KEY-----" },
+            { "-----BEGIN ENCRYPTED PRIVATE KEY-----", "-----END ENCRYPTED PRIVATE KEY-----" },
+            { "-----BEGIN PRIVATE KEY-----",        "-----END PRIVATE KEY-----" },
+        };
+        int pem_found = 0;
+        for (int i = 0; i < 4 && !pem_found; i++) {
+            ret = mbedtls_pem_read_buffer(&pem, key_markers[i][0], key_markers[i][1],
+                (const unsigned char *)pem_buf, pwd, pwd_len, &use_len);
+            if (ret != 0) {
+                continue;
+            }
+            pem_found = 1;
             const unsigned char *der_buf = mbedtls_pem_get_buffer(&pem, &key_der_len);
             ret = _parse_private_key(&client_key, der_buf, key_der_len,
                 pwd, pwd_len);
+        }
+        if (!pem_found) {
+            ret = MBEDTLS_ERR_PEM_NO_HEADER_FOOTER_PRESENT;
         }
         mbedtls_pem_free(&pem);
         free(pem_buf);
@@ -1915,12 +1912,15 @@ int AsyncTCPTLS::startSSLServer(tcp_pcb *pcb,
 
     mbedtls_ssl_conf_own_cert(&ssl_conf, &client_cert, &client_key);
 
-#if ASYNCTCP_MBEDTLS_MAJOR < 4
-    mbedtls_ssl_conf_rng(&ssl_conf, mbedtls_ctr_drbg_random, &drbg_ctx);
-#endif
+    // Server-side session cache (TLS resumption). Shared across connections
+    // of this server instance; the cache context is owned by the AsyncServer.
+    if (session_cache != NULL) {
+        mbedtls_ssl_conf_session_cache(&ssl_conf, session_cache,
+            mbedtls_ssl_cache_get, mbedtls_ssl_cache_set);
+    }
 
-#if defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
-    mbedtls_ssl_conf_max_frag_len(&ssl_conf, MBEDTLS_SSL_MAX_FRAG_LEN_4096);
+#if MBEDTLS_VERSION_MAJOR < 4
+    mbedtls_ssl_conf_rng(&ssl_conf, mbedtls_ctr_drbg_random, &drbg_ctx);
 #endif
 
     if ((ret = mbedtls_ssl_setup(&ssl_ctx, &ssl_conf)) != 0) {
