@@ -80,10 +80,12 @@
 // (RFC 6066 is client-optional), so a full 16KB record would need ~17.5KB of
 // slab and blow the ESP8266's ~20KB free heap mid-handshake (OOM). The OTA
 // uploader is chunked instead (small POST bodies -> small TLS records), so the
-// server buffer only needs to hold those small records: 4096 is enough. 4096 +
-// the 1109 out-record ring = 5205B server slab, which fits the serve-time arena.
+// server buffer only needs to hold those small records: 3328 covers the 2816B
+// OTA chunk (~2822 ciphertext) with margin. 3328 + the 1109 out-record ring =
+// 4437B server slab -> ~1.9KB extra post-slab headroom vs 4096, and the serve
+// floor (8637) stays clearable by the fragmented arena (~10KB sustained).
 #ifndef SSL_SERVER_IN_BUFFER_SIZE
-#define SSL_SERVER_IN_BUFFER_SIZE 4096
+#define SSL_SERVER_IN_BUFFER_SIZE 3328
 #endif
 
 #ifndef SSL_OUT_BUFFER_SIZE
@@ -135,13 +137,15 @@
 // (spelled in the shared config above; no server counterpart — see note above).
 
 // Force-close for a serve with zero engine progress (e.g. send-pool stall).
-// Too low aborts healthy conns; 20s lets lwIP recovery drain it.
+// 20s: slow enough that a wedged serve's own lwIP close/ack latency settles
+// before we force TBS free (avoids racing retransmit segments against the
+// slab, which surfaced as a poison-block heap crash at 5s).
 #ifndef SSL_STALL_RESET_MS
 #define SSL_STALL_RESET_MS 20000
 #endif
 
 // Min free heap to accept/park/promote a TLS conn; below it refuse (RST).
-// Parked slots pin ~5.2KB each (4096 in + 1109 out); alloc below ~4.5K free
+// Parked slots pin ~4.4KB each (3328 in + 1109 out); alloc below ~4.5K free
 // crashed the device. Contiguity gated separately by SSL_SERVE_BLOCK (== the
 // server slab via SSL_BUFFER_SLAB_SERVER). Keeps ~3.8K free headroom after one
 // slab alloc.
@@ -149,38 +153,38 @@
 #define SSL_PRESSURE_PARK_FLOOR (SSL_BUFFER_SLAB_SERVER + 3800)  // ≈ 9005 B
 #endif
 
-// Absolute floor below which the server refuses a conn outright (RST) instead
-// of even queuing the 24B HOLD pending_pcb — at ~976B free a 24-32B malloc
-// throws an unhandled C++ OOM on ESP8266. Keeps the overflow-held tier from
-// crashing a conn that is otherwise surviving on heartbeat budget.
-#ifndef SSL_HOLD_MIN_HEAP
-#define SSL_HOLD_MIN_HEAP 2000
+// Serve bar in _accept/_promoteSlot: pre-slab heap must clear slab + ~4.2K
+// app burst. Fragmented arena tops out ~9.8-10.3K, so this stays clearable
+// while 11.7K (slab+6.5K) was not (deadlocked all conns).
+#ifndef SSL_PRESSURE_SERVE_FLOOR
+#define SSL_PRESSURE_SERVE_FLOOR (SSL_BUFFER_SLAB_SERVER + 4200)  // ≈ 8637 B @4437 slab
 #endif
 
-// Parked-conn queue depth; each slot pins ~4KB (pcb + RX pbufs). The 5.2KB
-// server slab eats the arena during a serve, so 1 slot leaves room for the
-// next promotion; more starve the 20KB serve floor.
-#ifndef SSL_PARKED_SLOTS
+// Parked-conn queue admission floor: below this even the 24B queue malloc
+// would throw (OOM). Above it, always admit the raw pcb; the ClientHello is
+// only buffered into heap when free heap also clears PRESSURE_PARK_FLOOR (else
+// it parks in lwIP's recv window — kernel pool, no heap).
+#ifndef SSL_PARKED_MIN_HEAP
+#define SSL_PARKED_MIN_HEAP 2000
+#endif
+
+// Parked-conn queue depth; each slot pins ~2KB of buffered ClientHello (heap).
+// 1 slot keeps the serve arena recoverable above SSL_PRESSURE_SERVE_FLOOR.
+#undef SSL_PARKED_SLOTS
 #define SSL_PARKED_SLOTS 1
-#endif
-
-// Overflow-hold depth: park full (or heap under floor) -> HELD, not RST (same
-// pool-only buffering as a park slot). Both queues full -> RST.
-#ifndef SSL_HOLD_LIMIT
-#define SSL_HOLD_LIMIT 4
-#endif
 
 // Serve/promote admission, in _accept and _promoteSlot:
-//  - free heap >= PRESSURE_PARK_FLOOR (starvation guard).
+//  - free heap >= SSL_PRESSURE_SERVE_FLOOR (serve bar; park budget keeps
+//    PRESSURE_PARK_FLOOR).
 //  - maxblock >= SERVE_BLOCK == server slab (ctor's ONE contiguous big alloc).
 // SERVE_BLOCK must stay exactly the slab size: slab+margin (or 9000) deadlocks —
 // it refuses every later conn while maxblock sits under it.
 
 // Server-side session cache (TLS resumption). Each LRU entry = 100B static;
-// resumption skips the Certificate flight. 6 entries = 600B covers Chrome's
+// resumption skips the Certificate flight. 3 entries = 300B covers Chrome's
 // 6-conn parallelism without LRU thrash.
 #undef SSL_SESSION_CACHE
-#define SSL_SESSION_CACHE 6
+#define SSL_SESSION_CACHE 3
   
 #ifndef SSL_SESSION_CACHE_SIZE
 #define SSL_SESSION_CACHE_SIZE 100
@@ -388,6 +392,7 @@ bool tcp_ssl_has(struct tcp_pcb* pcb);
 #if ASYNC_TCP_SSL_ENABLE_SERVER
 uint8_t tcp_ssl_has_client();
 uint8_t tcp_ssl_client_count();
+uint8_t tcp_ssl_server_handshake_busy();
 uint8_t tcp_ssl_parked_count();
 // Diagnostics for the SETTLED log.
 unsigned long tcp_ssl_serve_conns_total();

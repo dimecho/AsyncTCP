@@ -138,8 +138,8 @@ tcp_ssl_pcb* tcp_ssl_alloc_pcb(struct tcp_pcb* pcb, bool is_server) {
   ssl_pcb->_slab = nullptr;
 
   // ONE contiguous allocation for inbuf (+ server record buffer) + outbound
-  // ring. Server sessions need 4096B of record buffer (the OTA uploader is
-  // chunked, so inbound TLS records stay small), so their slab is ~5.2KB;
+  // ring. Server sessions need 3328B of record buffer (the OTA uploader is
+  // chunked, so inbound TLS records stay small), so their slab is ~4.4KB;
   // clients stay compact (~3.2KB). The admission BLOCK bar (SSL_SERVE_BLOCK
   // == server slab) guarantees the server's ONE big hole exists before serve.
   const size_t in_sz = is_server ? SSL_SERVER_IN_BUFFER_SIZE : SSL_IN_BUFFER_SIZE;
@@ -426,7 +426,7 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
   // --- Stream pending TLS ciphertext out of the lwIP pbuf queue into
   // --- BearSSL (runs in loop() context, safe to yield). No fixed accumulator:
   // --- the ENGINE's record buffer sizes each record, so records larger than
-  // --- the 4096B server inbuf (e.g. a 16KB un-chunked browser record) get
+  // --- the 3328B server inbuf (e.g. a 16KB un-chunked browser record) get
   // --- BR_ERR_TOO_LARGE — the OTA uploader is chunked to keep records small.
   // --- tcp_recved() credits only bytes actually fed here, so the peer's
   // --- window closes when the engine stalls and opens as we consume.
@@ -633,7 +633,7 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
         // fit. tcp_output() is idempotent and safe to call repeatedly (only
         // sends if there is unsent data).
         tcp_output(ssl_pcb->tcp);
-        async_tcp_log_v("SENDREC: defer err=%d out=%u sndbuf=%u queuelen=%u/%u freeheap=%u hard=%u\n",
+        async_tcp_log_d("SENDREC: defer err=%d out=%u sndbuf=%u queuelen=%u/%u freeheap=%u hard=%u\n",
                         (int)werr,
                         (unsigned)ssl_pcb->out_len,
                         (unsigned)tcp_sndbuf(ssl_pcb->tcp),
@@ -857,13 +857,13 @@ const char* tcp_ssl_error_string(int err) {
 
 /*
   =====================================================================
-  Client glue (client role for AsyncTCP TLS)
+  Client role for AsyncTCP TLS
   =====================================================================
 */
 /*
-  TLS-client glue: the x509 insecure decoder, client cipher suites, engine
+  TLS-client: the x509 insecure decoder, client cipher suites, engine
   base init, and connection setup. Compiled whenever ASYNC_TCP_SSL_ENABLED is
-  set (alongside the server glue). Include "ESPAsyncTCPClient.h" to use it.
+  set (alongside the server).
 */
 
 // NOTE: TLS.h must be included FIRST because it defines the
@@ -1077,13 +1077,12 @@ int tcp_ssl_new_client(struct tcp_pcb* pcb, const char* host, const br_x509_clas
 
 /*
   =====================================================================
-  Server glue (server role for AsyncTCP TLS)
+  Server role for AsyncTCP TLS
   =====================================================================
 */
 /*
-  TLS-server glue: certificate/private-key context parsing and connection
-  setup. Compiled whenever ASYNC_TCP_SSL_ENABLED is set (alongside the client
-  glue). Include "ESPAsyncTCPServer.h" to use it.
+  TLS-server: certificate/private-key context parsing and connection
+  setup. Compiled whenever ASYNC_TCP_SSL_ENABLED is set (alongside the client).
 */
 
 // NOTE: TLS.h must be included FIRST because it defines the
@@ -1727,6 +1726,19 @@ uint8_t tcp_ssl_client_count() {
     if (iter->is_server) n++;
   }
   return n;
+}
+
+// Is any server session still mid-handshake? The parked queue's ClientHello
+// pbufs rob a RUNNING handshake's heap, so admission needs to know which
+// phase the (single, SSL_MAX_CONNECTIONS=1) live serve conn is in. No
+// dedicated flag — reuse ssl_pcb->handshake_done, the session's own
+// handshake-complete bit (single source of truth, auto-cleared on teardown by
+// tcp_ssl_free list removal).
+uint8_t tcp_ssl_server_handshake_busy() {
+  for (tcp_ssl_pcb* iter = tcp_ssl_pcbs; iter; iter = iter->next) {
+    if (iter->is_server && !iter->handshake_done) return 1;
+  }
+  return 0;
 }
 
 #endif  // ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_SERVER
