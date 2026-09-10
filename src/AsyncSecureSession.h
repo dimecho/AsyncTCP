@@ -85,7 +85,7 @@
 // 4437B server slab -> ~1.9KB extra post-slab headroom vs 4096, and the serve
 // floor (8637) stays clearable by the fragmented arena (~10KB sustained).
 #ifndef SSL_SERVER_IN_BUFFER_SIZE
-#define SSL_SERVER_IN_BUFFER_SIZE 3328
+#define SSL_SERVER_IN_BUFFER_SIZE 2560
 #endif
 
 #ifndef SSL_OUT_BUFFER_SIZE
@@ -144,25 +144,15 @@
 #define SSL_STALL_RESET_MS 20000
 #endif
 
-// Min free heap to accept/park/promote a TLS conn; below it refuse (RST).
-// Parked slots pin ~4.4KB each (3328 in + 1109 out); alloc below ~4.5K free
-// crashed the device. Contiguity gated separately by SSL_SERVE_BLOCK (== the
-// server slab via SSL_BUFFER_SLAB_SERVER). Keeps ~3.8K free headroom after one
-// slab alloc.
-#ifndef SSL_PRESSURE_PARK_FLOOR
-#define SSL_PRESSURE_PARK_FLOOR (SSL_BUFFER_SLAB_SERVER + 3800)  // ≈ 9005 B
-#endif
-
-// Serve bar in _accept/_promoteSlot: pre-slab heap must clear slab + ~4.2K
-// app burst. Fragmented arena tops out ~9.8-10.3K, so this stays clearable
-// while 11.7K (slab+6.5K) was not (deadlocked all conns).
-#ifndef SSL_PRESSURE_SERVE_FLOOR
-#define SSL_PRESSURE_SERVE_FLOOR (SSL_BUFFER_SLAB_SERVER + 4200)  // ≈ 8637 B @4437 slab
+// Free heap floor for accept/park/promote; refuse if below. Keeps headroom for slab + app burst.
+// Shared pressure floor for serve/park admission.
+#ifndef SSL_PRESSURE_FLOOR
+#define SSL_PRESSURE_FLOOR 10500  // post-alloc headroom
 #endif
 
 // Parked-conn queue admission floor: below this even the 24B queue malloc
 // would throw (OOM). Above it, always admit the raw pcb; the ClientHello is
-// only buffered into heap when free heap also clears PRESSURE_PARK_FLOOR (else
+// only buffered into heap when free heap also clears PRESSURE_FLOOR (else
 // it parks in lwIP's recv window — kernel pool, no heap).
 #ifndef SSL_PARKED_MIN_HEAP
 #define SSL_PARKED_MIN_HEAP 2000
@@ -174,17 +164,16 @@
 #define SSL_PARKED_SLOTS 1
 
 // Serve/promote admission, in _accept and _promoteSlot:
-//  - free heap >= SSL_PRESSURE_SERVE_FLOOR (serve bar; park budget keeps
-//    PRESSURE_PARK_FLOOR).
+//  - free heap >= SSL_PRESSURE_FLOOR (serve/park bar).
 //  - maxblock >= SERVE_BLOCK == server slab (ctor's ONE contiguous big alloc).
 // SERVE_BLOCK must stay exactly the slab size: slab+margin (or 9000) deadlocks —
 // it refuses every later conn while maxblock sits under it.
 
 // Server-side session cache (TLS resumption). Each LRU entry = 100B static;
-// resumption skips the Certificate flight. 3 entries = 300B covers Chrome's
+// resumption skips the Certificate flight. 2 entries = 200B covers Chrome's
 // 6-conn parallelism without LRU thrash.
 #undef SSL_SESSION_CACHE
-#define SSL_SESSION_CACHE 3
+#define SSL_SESSION_CACHE 2
   
 #ifndef SSL_SESSION_CACHE_SIZE
 #define SSL_SESSION_CACHE_SIZE 100

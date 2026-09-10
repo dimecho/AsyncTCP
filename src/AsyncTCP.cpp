@@ -2333,6 +2333,9 @@ int8_t AsyncServer::_accept(tcp_pcb *pcb, int8_t err) {
   if (NULL == pcb || ERR_OK != err) {
     return ERR_OK;
   }
+  // Cache max free block per accept to avoid repeated allocator walk
+  static size_t cachedMaxBlock = 0;
+  cachedMaxBlock = ESP.getMaxFreeBlockSize();
   if (_noDelay
 #if ASYNC_TCP_SSL_ENABLED
       || _ssl_ctx
@@ -2360,18 +2363,14 @@ int8_t AsyncServer::_accept(tcp_pcb *pcb, int8_t err) {
     // ClientHello robs the live handshake); body-phase parks freely. RST only
     // on live-handshake heap starvation or queue full / heap under MIN.
     int accept_heap = (int)ESP.getFreeHeap();
-    bool live_conn = tcp_ssl_client_count() >= SSL_MAX_CONNECTIONS;
-    bool need_live_park_headroom = live_conn && tcp_ssl_server_handshake_busy() &&
-        (unsigned)accept_heap < (unsigned)(SSL_PRESSURE_PARK_FLOOR + SSL_PARKED_RX_CAP);
-    bool park_budget_ok = live_conn || (unsigned)accept_heap >=
-        (unsigned)(SSL_PRESSURE_PARK_FLOOR + (1 + s_async_parked_tls) * SSL_PARKED_RX_CAP);
-    if (live_conn ||
-        (unsigned)accept_heap < SSL_PRESSURE_SERVE_FLOOR ||
-        (unsigned)ESP.getMaxFreeBlockSize() < SSL_SERVE_BLOCK) {
+    uint8_t ssl_cnt = tcp_ssl_client_count();
+    bool live_conn = ssl_cnt >= SSL_MAX_CONNECTIONS;
+    bool needPark = live_conn ||
+                    (unsigned)accept_heap < SSL_PRESSURE_FLOOR ||
+                    cachedMaxBlock < SSL_SERVE_BLOCK;
+    if (needPark) {
       if (s_async_parked_tls < SSL_PARKED_SLOTS &&
-          (unsigned)accept_heap >= SSL_PARKED_MIN_HEAP &&
-          !need_live_park_headroom &&
-          park_budget_ok) {
+          (unsigned)accept_heap >= SSL_PARKED_MIN_HEAP) {
         struct pending_pcb *new_item = (struct pending_pcb *)malloc(sizeof(struct pending_pcb));
         if (new_item) {
           new_item->pcb = pcb;
@@ -2613,6 +2612,11 @@ void AsyncServer::_error(int8_t err) {
 }
 
 int8_t AsyncServer::_promoteSlot() {
+  // Cache expensive queries once per promote
+  static size_t cachedMaxBlock = 0;
+  cachedMaxBlock = ESP.getMaxFreeBlockSize();
+  int promote_heap = ESP.getFreeHeap();
+  uint8_t ssl_cnt = tcp_ssl_client_count();
   // Lifts the queued raw PCB at the head to a live AsyncClient (its ClientHello,
   // if buffered above the serve floor, is fed in at the end -> fastest
   // handshake). Runs whenever a live slot is free (TLS buffers freed, count <
@@ -2622,7 +2626,7 @@ int8_t AsyncServer::_promoteSlot() {
   // burns several KB mid-flight, so below PRESSURE_PARK_FLOOR we keep the slot
   // queued and retry on the next tick — the arena recovers to its floor after
   // each conn frees its TLS buffers.
-  if (tcp_ssl_client_count() >= SSL_MAX_CONNECTIONS) {
+  if (ssl_cnt >= SSL_MAX_CONNECTIONS) {
     return ERR_OK;
   }
   struct pending_pcb *p = _pending;
@@ -2630,12 +2634,12 @@ int8_t AsyncServer::_promoteSlot() {
     return ERR_OK;
   }
 #if ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_SERVER
-  // Same serve gate as _accept: free heap >= SSL_PRESSURE_SERVE_FLOOR AND maxblock >=
+  // Same serve gate as _accept: free heap >= SSL_PRESSURE_FLOOR AND maxblock >=
   // slab. SERVE_BLOCK must stay exactly the slab size — slab+margin (or 9000)
   // refuses every conn while maxblock sits under it. Below SSR, keep queued,
   // retry next tick.
-  if ((unsigned)ESP.getFreeHeap() < SSL_PRESSURE_SERVE_FLOOR ||
-      (unsigned)ESP.getMaxFreeBlockSize() < SSL_SERVE_BLOCK) {
+  if ((unsigned)promote_heap < SSL_PRESSURE_FLOOR ||
+      cachedMaxBlock < SSL_SERVE_BLOCK) {
     // Head-wedge guard: a below-floor head can't serve, but _poll returns it
     // straight here so its buffered ClientHello is never shed, pinning the
     // heap under the floor forever. After idle, abort it; browser retries.
@@ -2648,7 +2652,7 @@ int8_t AsyncServer::_promoteSlot() {
         pbuf_free(w->pb);
       }
       free(w);
-      async_tcp_log_d("_promoteSlot: shedding queued head (parked=%ums, freeheap=%u, maxblock=%u)", (unsigned)(millis() - w->parked_ms), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize());
+      async_tcp_log_d("_promoteSlot: shedding queued head (parked=%ums, freeheap=%u, maxblock=%u)", (unsigned)(millis() - w->parked_ms), (unsigned)promote_heap, (unsigned)cachedMaxBlock);
       tcp_arg(wpcb, NULL);
       tcp_recv(wpcb, NULL);
       tcp_poll(wpcb, NULL, 0);
@@ -2662,12 +2666,12 @@ int8_t AsyncServer::_promoteSlot() {
     // browser retries into a clean serve) instead of parking forever.
     unsigned free_heap = (unsigned)ESP.getFreeHeap();
     unsigned pinned = (unsigned)s_async_parked_tls * SSL_PARKED_RX_CAP;
-    if (free_heap < SSL_PRESSURE_SERVE_FLOOR && free_heap + pinned >= SSL_PRESSURE_SERVE_FLOOR) {
+    if (free_heap < SSL_PRESSURE_FLOOR && free_heap + pinned >= SSL_PRESSURE_FLOOR) {
       int washed = abort_queued_items(&_pending, &s_async_parked_tls);
       async_tcp_log_d("_promoteSlot: washing pinned queue (freeheap=%u pins=%u washed=%u)", free_heap, pinned, washed);
       return ERR_ABRT;
     }
-    async_tcp_log_d("_promoteSlot: freeheap=%u maxblock=%u below serve floor, keeping slot queued", (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize());
+    async_tcp_log_d("_promoteSlot: freeheap=%u maxblock=%u below serve floor, keeping slot queued", (unsigned)promote_heap, (unsigned)cachedMaxBlock);
     return ERR_OK;
   }
 #endif
