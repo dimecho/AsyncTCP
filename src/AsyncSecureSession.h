@@ -21,9 +21,9 @@
 #define SSL_QUEUE_IDLE_MS 20000
 #endif
 
-#ifndef SSL_PARKED_SLOTS
-#define SSL_PARKED_SLOTS 6
-#endif
+// NOTE: SSL_PARKED_SLOTS is NOT defined here. It is stack-specific:
+// ESP8266 (BearSSL) -> 1 (lwIP RX pbuf pool is only 10; 3 slots starved it
+// under a 6-conn browser burst); ESP32 (mbedTLS) -> 6.
 
 #ifndef SSL_PARKED_RX_CAP
 #define SSL_PARKED_RX_CAP 2000
@@ -64,28 +64,19 @@
 #undef SSL_MAX_CONNECTIONS
 #define SSL_MAX_CONNECTIONS 1
 
-// ESP8266: aggressive client rx-echo cutoff (slow browser under heap pressure
-// during OTA chunk handshakes gets 2s, not the shared 10s).
+// ESP8266: aggressive client rx-echo cutoff (2s under heap pressure, not 10s shared).
 #undef SSL_HANDSHAKE_TIMEOUT
 #define SSL_HANDSHAKE_TIMEOUT 2000
 
-// CLIENT-role inbound record buffer. This role offers MFLN (SSL_CLIENT_MFLN),
-// so the peer caps records at 1024+overhead; 2048 covers ClientHello + any
-// peer that ignores MFLN.
+// CLIENT-role inbound record buffer with MFLN cap (2048 covers ClientHello + any peer ignoring MFLN).
 #ifndef SSL_IN_BUFFER_SIZE
 #define SSL_IN_BUFFER_SIZE 2048
 #endif
 
-// SERVER-role inbound record buffer. Browsers never send max_fragment_length
-// (RFC 6066 is client-optional), so a full 16KB record would need ~17.5KB of
-// slab and blow the ESP8266's ~20KB free heap mid-handshake (OOM). The OTA
-// uploader is chunked instead (small POST bodies -> small TLS records), so the
-// server buffer only needs to hold those small records: 3328 covers the 2816B
-// OTA chunk (~2822 ciphertext) with margin. 3328 + the 1109 out-record ring =
-// 4437B server slab -> ~1.9KB extra post-slab headroom vs 4096, and the serve
-// floor (8637) stays clearable by the fragmented arena (~10KB sustained).
+// SERVER inbuffer: 2048 ciphertext. Matches SSL_IN_BUFFER_SIZE; holds a full
+// OTA chunk record (RFC 5246 AES-GCM overhead ~29B => 1990 plaintext fits).
 #ifndef SSL_SERVER_IN_BUFFER_SIZE
-#define SSL_SERVER_IN_BUFFER_SIZE 2560
+#define SSL_SERVER_IN_BUFFER_SIZE 2048
 #endif
 
 #ifndef SSL_OUT_BUFFER_SIZE
@@ -98,10 +89,12 @@
 #define SSL_RX_PEND_MAX 16
 #endif
 
-// Outbound record ring depth (K slots per conn). K=2 = +1109B/slab and
-// starved serve budget under bursts; K=1 is stable.
+// Outbound record ring depth (K slots per conn). K=2 keeps 2 records (~2.2KB
+// ciphertext) in flight per RTT: fast retransmit on loss instead of 3s RTO,
+// ~2x throughput vs K=1. Cost +1109B/slab per slot; SSL_SERVE_BLOCK tracks
+// the slab, so a tight heap parks/sheds instead of failing.
 #ifndef SSL_RECORD_RING_SLOTS
-#define SSL_RECORD_RING_SLOTS 1
+#define SSL_RECORD_RING_SLOTS 2
 #endif
 
 // Outbound ring region: K slots x record size.
@@ -158,10 +151,15 @@
 #define SSL_PARKED_MIN_HEAP 2000
 #endif
 
-// Parked-conn queue depth; each slot pins ~2KB of buffered ClientHello (heap).
-// 1 slot keeps the serve arena recoverable above SSL_PRESSURE_SERVE_FLOOR.
+// Parked-conn queue depth (ESP8266); each slot pins unpaged ClientHello
+// pbufs in lwIP's RX pool, which is raised to 12 (from 10) to sustain ONE
+// parked conn while the live serve conn spins. 3 slots starved the pool
+// under a 6-conn browser burst -> ERR_MEM writes -> 20s stall (seen live),
+// so the extra slot is the tested-safe ceiling. Refused conns simply RST;
+// browsers retry. ESP32 sets its own 6; these are intentionally separate
+// so neither build pays for the other's pool profile.
 #undef SSL_PARKED_SLOTS
-#define SSL_PARKED_SLOTS 1
+#define SSL_PARKED_SLOTS 2
 
 // Serve/promote admission, in _accept and _promoteSlot:
 //  - free heap >= SSL_PRESSURE_FLOOR (serve/park bar).
@@ -241,6 +239,14 @@ typedef void (*tcp_ssl_data_cb_t)(void* arg, struct tcp_pcb* tcp, uint8_t* data,
 typedef void (*tcp_ssl_handshake_cb_t)(void* arg, struct tcp_pcb* tcp, SSL* ssl);
 typedef void (*tcp_ssl_error_cb_t)(void* arg, struct tcp_pcb* tcp, int8_t err);
 
+// Engine pump state. Only one scheduled engine run can be waiting
+// at a time. See schedule_ssl_engine() for how the states are used.
+enum EnginePumpState : uint8_t {
+  ENGINE_PUMP_IDLE = 0,     // no work to do, nothing scheduled
+  ENGINE_PUMP_DROPPED,      // work waiting, but the one-shot could not be scheduled
+  ENGINE_PUMP_QUEUED        // work waiting and a one-shot IS scheduled
+};
+
 // Per-connection state for a BearSSL session.
 struct tcp_ssl_pcb {
   struct tcp_pcb* tcp;
@@ -304,6 +310,9 @@ struct tcp_ssl_pcb {
   // browser can't recover. Resets apply only while body_started==false.
   bool body_started;
 
+  // Engine pump guard (see EnginePumpState above).
+  EnginePumpState engine_pump_state;
+
   // Callbacks and arguments
   void* arg;
   tcp_ssl_data_cb_t on_data;
@@ -350,7 +359,10 @@ tcp_ssl_pcb* find_ssl_pcb(struct tcp_pcb* pcb);
 tcp_ssl_pcb* tcp_ssl_alloc_pcb(struct tcp_pcb* pcb, bool is_server);
 void tcp_ssl_register_pcb(tcp_ssl_pcb* ssl_pcb);
 void process_ssl_engine(tcp_ssl_pcb* ssl_pcb);
-void schedule_ssl_engine(tcp_ssl_pcb* ssl_pcb);
+// Returns true if the engine run was scheduled, false if the shared
+// schedule_function pool is full (the DROPPED state then stays set and
+// AsyncClient::_poll drives the engine directly).
+bool schedule_ssl_engine(tcp_ssl_pcb* ssl_pcb);
 void tcp_ssl_sent(struct tcp_pcb* pcb, size_t acked);
 // True once a conn has been in a hard SENDREC stall longer than stall_ms.
 // AsyncClient::_poll uses it to bound a pool-exhaustion wedge.
@@ -410,6 +422,13 @@ void br_x509_insecure_init(x509_insecure_context* ctx, bool use_fingerprint, con
 #pragma once
 
 #if ASYNC_TCP_SSL_ENABLED
+
+// Parked-conn queue depth (ESP32): ~500KB heap, so 6 slots of pinned
+// ClientHellos is comfortably recoverable (see the ESP8266 branch for its
+// own 3-slot cap — single-sourced per build).
+#ifndef SSL_PARKED_SLOTS
+#define SSL_PARKED_SLOTS 6
+#endif
 
 // --- mbedTLS version abstraction -----------------------------------------
 // Mbed TLS v3 (stable Arduino core 3.x): legacy entropy + CTR-DRBG RNG.

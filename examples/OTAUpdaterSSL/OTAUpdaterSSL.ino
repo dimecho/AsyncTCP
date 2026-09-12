@@ -41,7 +41,7 @@ const char *AP_PASSWORD = "12345678";  // min 8 chars
 #if defined(ESP8266)
 // Chunk size (raw bytes) - keep comfortably below the 4096-byte BearSSL
 // inbound record buffer once TLS + HTTP headers are added.
-#define OTA_CHUNK 3000
+#define OTA_CHUNK 1990
 #else
 #define OTA_CHUNK 0  // 0 => whole file in a single POST
 #endif

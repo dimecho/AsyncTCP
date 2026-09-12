@@ -7,25 +7,8 @@
 // Selected at compile time via #if defined(ESP8266). Only one stack compiles per target.
 #if defined(ESP8266)
 // ===== begin BearSSL/ESP8266 (AsyncTCP) =====
-/*
-  This file provides the complete BearSSL bridge in ONE compilation unit:
-    - the role-agnostic core (registry, per-connection state, engine pump)
-      shared by TLS clients and servers,
-    - the TLS-client glue (x509, client engine init, tcp_ssl_new_client),
-    - the TLS-server glue (cert/private-key ctx, tcp_ssl_new_server,
-      tcp_ssl_has_client / tcp_ssl_client_count).
-
-  Each role block is guarded by its own macro so builds can trim either role.
-
-  FULLY PATCHED & COMPATIBLE VERSION:
-  - Uses br_ssl_engine_set_buffers_bidi (separate buffers) for full
-    compatibility with ESP8266 Arduino Core versions.
-  - PROGMEM-aware: handles certs from flash, fixing LoadStoreError crashes.
-  - Resolves incompatibility with older BearSSL PEM decoder APIs.
-  - Robust NULL checks prevent crashes from invalid arguments.
-  - BearSSL calls use the ESP8266 StackThunk mechanism, swapping to a
-    separate heap-allocated stack for crypto operations.
-*/
+/* BearSSL bridge: single TU for client+server, role-agnostic core, engine pump,
+   MFLN paths, PROGMEM certs, NULL checks, StackThunk stack. */
 
 #include "AsyncSecureSession.h"
 
@@ -122,6 +105,7 @@ tcp_ssl_pcb* tcp_ssl_alloc_pcb(struct tcp_pcb* pcb, bool is_server) {
   ssl_pcb->out_ring_acked = 0;
   ssl_pcb->hard_defer_start = 0;
   ssl_pcb->body_started = false;
+  ssl_pcb->engine_pump_state = ENGINE_PUMP_IDLE;
   ssl_pcb->arg = nullptr;
   ssl_pcb->on_data = nullptr;
   ssl_pcb->on_handshake = nullptr;
@@ -380,18 +364,31 @@ size_t tcp_ssl_close(struct tcp_pcb* pcb) {
 
 // --- Internal Engine Logic ---
 
-// Defer process_ssl_engine to loop() context via schedule_function. The
-// BearSSL engine calls from loop() run on the thunked stack (above), giving
-// crypto a larger working stack than the ESP8266's 4KB CONT stack.
-void schedule_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
-  schedule_function([ssl_pcb]() {
+// Defer process_ssl_engine to loop() context (thunked stack > 4KB CONT).
+// Returns false if the engine could not be scheduled (whether the work is
+// still remembered in DROPPED state, so _poll picks it up later).
+bool schedule_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
+  if (!ssl_pcb) return false;
+  // IDLE or DROPPED -> schedule one. QUEUED already has one scheduled, skip.
+  if (ssl_pcb->engine_pump_state == ENGINE_PUMP_QUEUED) return false;
+  // Offer the work for scheduling. Remember it as long as the callback has not
+  // run yet; DROPPED becomes QUEUED on success, or stays DROPPED if the
+  // schedule_function pool is full so _poll can pump instead.
+  ssl_pcb->engine_pump_state = ENGINE_PUMP_DROPPED;  // provisional
+  bool armed = schedule_function([ssl_pcb]() {
+    // Only clear the state if the pcb is still registered: a yield() can free it.
     for (tcp_ssl_pcb* iter = tcp_ssl_pcbs; iter; iter = iter->next) {
       if (iter == ssl_pcb) {
+        ssl_pcb->engine_pump_state = ENGINE_PUMP_IDLE;
         process_ssl_engine(ssl_pcb);
         return;
       }
     }
   });
+  if (armed) {
+    ssl_pcb->engine_pump_state = ENGINE_PUMP_QUEUED;
+  }
+  return armed;
 }
 
 // Returns true if ssl_pcb is still a live member of tcp_ssl_pcbs.
@@ -426,7 +423,7 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
   // --- Stream pending TLS ciphertext out of the lwIP pbuf queue into
   // --- BearSSL (runs in loop() context, safe to yield). No fixed accumulator:
   // --- the ENGINE's record buffer sizes each record, so records larger than
-  // --- the 3328B server inbuf (e.g. a 16KB un-chunked browser record) get
+  // --- the 2048B server inbuf (e.g. a 16KB un-chunked browser record) get
   // --- BR_ERR_TOO_LARGE — the OTA uploader is chunked to keep records small.
   // --- tcp_recved() credits only bytes actually fed here, so the peer's
   // --- window closes when the engine stalls and opens as we consume.
@@ -855,16 +852,8 @@ const char* tcp_ssl_error_string(int err) {
 
 #endif  // ASYNC_TCP_SSL_ENABLED
 
-/*
-  =====================================================================
-  Client role for AsyncTCP TLS
-  =====================================================================
-*/
-/*
-  TLS-client: the x509 insecure decoder, client cipher suites, engine
-  base init, and connection setup. Compiled whenever ASYNC_TCP_SSL_ENABLED is
-  set (alongside the server).
-*/
+/* Client role for AsyncTCP TLS */
+/* TLS-client: x509 decoder, cipher suites, engine init, connection setup. */
 
 // NOTE: TLS.h must be included FIRST because it defines the
 // ASYNC_TCP_SSL_ENABLED / ASYNC_TCP_SSL_ENABLE_CLIENT macros the guard below
@@ -1075,15 +1064,8 @@ int tcp_ssl_new_client(struct tcp_pcb* pcb, const char* host, const br_x509_clas
 
 #endif  // ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_CLIENT
 
-/*
-  =====================================================================
-  Server role for AsyncTCP TLS
-  =====================================================================
-*/
-/*
-  TLS-server: certificate/private-key context parsing and connection
-  setup. Compiled whenever ASYNC_TCP_SSL_ENABLED is set (alongside the client).
-*/
+/* Server role for AsyncTCP TLS */
+/* TLS-server: cert/key parsing, connection setup. */
 
 // NOTE: TLS.h must be included FIRST because it defines the
 // ASYNC_TCP_SSL_ENABLED / ASYNC_TCP_SSL_ENABLE_SERVER macros the guard below
@@ -1839,11 +1821,7 @@ static err_t _tcp_ssl_write(tcp_pcb *pcb, const void *data, size_t size, uint8_t
     return msg.err;
 }
 
-/*
- * Custom LwIP BIO callbacks for mbedTLS
- * These bridge mbedTLS's I/O with LwIP raw TCP (tcp_pcb).
- * The void* ctx points to the AsyncSecureSession instance.
- */
+/* Custom LwIP BIO callbacks for mbedTLS, bridging I/O with raw TCP (tcp_pcb). ctx -> AsyncSecureSession. */
 
 static int _lwip_ssl_send(void *ctx, const unsigned char *buf, size_t len) {
     AsyncSecureSession *sslctx = (AsyncSecureSession *)ctx;
@@ -1886,9 +1864,7 @@ int AsyncSecureSession::_parse_private_key(mbedtls_pk_context *pk,
 }
 #endif
 
-/*
- * AsyncSecureSession implementation
- */
+/* AsyncSecureSession implementation */
 
 // Static shared RNG — initialized once, serialized on async task
 #if MBEDTLS_VERSION_MAJOR < 4
