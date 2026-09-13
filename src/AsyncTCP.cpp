@@ -1446,11 +1446,13 @@ int8_t AsyncClient::_close() {
   if (_server_discard_cb) {
     _server_discard_cb(_server_discard_cb_arg, this);
   }
+#if ASYNC_TCP_SSL_ENABLED
   // Pre-handshake death: `new AsyncClient` in _serveTls was never claimed by a
   // web request (_discard_cb NULL), so _close/_error alone leak one shell per
   // failed conn. Free it. Claimed conns have _handshake_done set (no-op) and
   // client-role conns have no _server_discard_cb (no-op).
   if (_server_discard_cb && !_handshake_done) { delete this; }
+#endif
   return err;
 }
 
@@ -1509,9 +1511,11 @@ void AsyncClient::_error(int8_t err) {
   if (_server_discard_cb) {
     _server_discard_cb(_server_discard_cb_arg, this);
   }
+#if ASYNC_TCP_SSL_ENABLED
   // Same orphan cleanup as _close(): pre-handshake server-conn shell that no
   // web request claimed must be freed here (abort/RST path never hits _close).
   if (_server_discard_cb && !_handshake_done) { delete this; }
+#endif
 }
 
 #if ASYNC_TCP_SSL_ENABLED
