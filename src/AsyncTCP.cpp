@@ -1298,13 +1298,21 @@ size_t AsyncClient::space() const {
   if ((_pcb != NULL) && (_pcb->state == ESTABLISHED)) {
 #if ASYNC_TCP_SSL_ENABLED
     if (_handshake_done) {
-      uint16_t s = tcp_sndbuf(_pcb);
       if (_pcb_secure) {
-        if (s >= 128)  // safe approach
-          return s - 128;
-        return 0;
+        // TLS backpressure is managed by the engine's SENDAPP buffer + record
+        // ring, NOT by the raw lwIP send window. Reporting tcp_sndbuf() here
+        // collapses as the peer's receive window fills mid-stream, so a caller
+        // gating on `space() >= buffer` (e.g. chunk-inflight pacing) would stop
+        // feeding the engine and strand the tail even though the engine still
+        // has room. Report the app-side capacity (>= the ~2*MSS send buffer) so
+        // the writer keeps feeding; tcp_ssl_write()/the ring defer exert real
+        // flow control and return short when truly out of room.
+        return SSL_OUT_BUFFER_SIZE;
       }
-      return s;
+      uint16_t s = tcp_sndbuf(_pcb);
+      if (s >= 128)  // safe approach
+        return s - 128;
+      return 0;
     }
     return 0;
 #else
@@ -1735,8 +1743,8 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
     // waiting on a wedged connection. Benign for the normal case: a finished
     // page is idle and the next nav opens a fresh socket anyway.
     if ((now - _rx_last_packet) >= SSL_STALL_RESET_MS &&
-        _tx_unacked_len == 0 && tcp_sndbuf(pcb) != 0) {
-      async_tcp_log_d("SSL conn idle >%ums (browser abort?), closing to free slot", (unsigned)SSL_STALL_RESET_MS);
+        !tcp_ssl_tx_busy(pcb) && tcp_sndbuf(pcb) != 0) {
+      async_tcp_log_d("SSL conn idle >%ums (browser abort?), closing to free slot, sndbuf=%u space=%u", (unsigned)SSL_STALL_RESET_MS, (unsigned)tcp_sndbuf(pcb), (unsigned)space());
       _close();
       return ERR_OK;
     }

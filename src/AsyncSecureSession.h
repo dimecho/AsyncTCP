@@ -80,7 +80,13 @@
 #endif
 
 #ifndef SSL_OUT_BUFFER_SIZE
-#define SSL_OUT_BUFFER_SIZE 1109
+// Derived from the build's -DTCP_MSS (536 or 1460). A TLS record caps at 2
+// segments (2*TCP_MSS ciphertext); no extra headroom so it fits the stock
+// lwIP snd_buf (2*TCP_MSS) and the emitter's tcp_sndbuf() >= out_len gate.
+#ifndef TCP_MSS
+#define TCP_MSS 536
+#endif
+#define SSL_OUT_BUFFER_SIZE (2 * TCP_MSS)
 #endif
 
 // Max lwIP pbufs queued unconsumed while the engine feeds (loop context).
@@ -89,12 +95,9 @@
 #define SSL_RX_PEND_MAX 16
 #endif
 
-// Outbound record ring depth (K slots per conn). K=2 keeps 2 records (~2.2KB
-// ciphertext) in flight per RTT: fast retransmit on loss instead of 3s RTO,
-// ~2x throughput vs K=1. Cost +1109B/slab per slot; SSL_SERVE_BLOCK tracks
-// the slab, so a tight heap parks/sheds instead of failing.
+// Outbound record ring depth (K slots per conn).
 #ifndef SSL_RECORD_RING_SLOTS
-#define SSL_RECORD_RING_SLOTS 2
+#define SSL_RECORD_RING_SLOTS 1
 #endif
 
 // Outbound ring region: K slots x record size.
@@ -123,8 +126,8 @@
 
 // No server MFLN (RFC 6066): browsers never offer max_fragment_length, so a
 // ServerHello echo is pointless and a forced cap would be ignored by the most
-// common clients. Server outbound records are already limited by the 1109B
-// output ring; inbound records are bounded by the server inbuf.
+// common clients. Server outbound records are already limited by the
+// 2*TCP_MSS output ring; inbound records are bounded by the server inbuf.
 
 // Client MFLN offered outbound; keeps inbound peer records <= client inbuf
 // (spelled in the shared config above; no server counterpart — see note above).
@@ -297,7 +300,7 @@ struct tcp_ssl_pcb {
   uint8_t        out_ring_next;    // next slot to fill (write cursor)
   uint8_t        out_ring_pinned;  // slots currently referencing un-ACKed records
   uint32_t       out_ring_acked;   // CUMULATIVE ciphertext ACKed (see tcp_ssl_sent);
-                                  // records span 2 segments (1053 > MSS 536), so release
+                                  // a record spans multiple MSS segments, so release
                                   // needs a running total, not the per-callback delta.
                                   // Zeroed when the ring fully empties.
 

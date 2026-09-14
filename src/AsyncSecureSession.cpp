@@ -322,6 +322,8 @@ size_t tcp_ssl_close(struct tcp_pcb* pcb) {
   // cannot cut trailing app data (a scheduled engine pass may not have run yet
   // when a response finishes and the connection is closed).
   if (br_ssl_engine_current_state(eng) & BR_SSL_SENDAPP) {
+    // flush(0): the last add() already force-sealed the tail in tcp_ssl_write;
+    // forcing here on an empty buffer would seal an empty record.
     br_ssl_engine_flush(eng, 0);
     size_t plen = 0;
     unsigned char* pbuf = br_ssl_engine_sendrec_buf(eng, &plen);
@@ -485,6 +487,9 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
     // transmit it. Done here (not per-write) to keep BR_SSL_SENDAPP open across
     // the synchronous header+content burst in tcp_ssl_write.
     if (state & BR_SSL_SENDAPP) {
+      // flush(0): never force here — an empty SENDAPP issue with force=1 seals
+      // an empty TLS record on every pump pass. Partial records were already
+      // sealed by tcp_ssl_write's force flush (data is guaranteed there).
       br_ssl_engine_flush(eng, 0);
     }
 
@@ -630,14 +635,6 @@ void process_ssl_engine(tcp_ssl_pcb* ssl_pcb) {
         // fit. tcp_output() is idempotent and safe to call repeatedly (only
         // sends if there is unsent data).
         tcp_output(ssl_pcb->tcp);
-        async_tcp_log_d("SENDREC: defer err=%d out=%u sndbuf=%u queuelen=%u/%u freeheap=%u hard=%u\n",
-                        (int)werr,
-                        (unsigned)ssl_pcb->out_len,
-                        (unsigned)tcp_sndbuf(ssl_pcb->tcp),
-                        (unsigned)tcp_sndqueuelen(ssl_pcb->tcp),
-                        (unsigned)TCP_SND_QUEUELEN,
-                        (unsigned)ESP.getFreeHeap(),
-                        (unsigned)(ssl_pcb->hard_defer_start ? 1 : 0));
       }
     }
 
@@ -691,9 +688,9 @@ void tcp_ssl_sent(struct tcp_pcb* pcb, size_t acked) {
   if (!ssl_pcb) return;
   // Free ring slots FIFO as ciphertext ACKs land. lwIP's sent callback reports
   // the bytes ACKed SINCE the last callback, but app records are larger than
-  // one MSS (1053B ciphertext across two 536B segments), so a record usually
-  // completes only after several 536B-ish ACKs. Comparing the per-callback
-  // delta against whole record sizes would strand the oldest slot forever
+  // one MSS, so a record usually completes only after several MSS-sized ACKs.
+  // Comparing the per-callback delta against whole record sizes would strand
+  // the oldest slot forever
   // (delayed ACK never reports one full record at once) and wedge the ring.
   // Accumulate into a running total instead: release a slot only once the
   // total covers its length, then debit that record before the next-oldest.
@@ -770,7 +767,7 @@ int tcp_ssl_write(struct tcp_pcb* pcb, const uint8_t* data, size_t len) {
   size_t clen = (len > wlen) ? wlen : len;
   memcpy(buf, data, clen);
   br_ssl_engine_sendapp_ack(eng, clen);
-  br_ssl_engine_flush(eng, 0);
+  br_ssl_engine_flush(eng, 1);  // force=0 withheld partial records (response tail stranded in WAIT_ACK forever)
   schedule_ssl_engine(ssl_pcb);
   return clen;
 }
