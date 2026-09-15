@@ -90,25 +90,6 @@ void tcp_ssl_shed_parked() {
   s_shed_requested = true;
 }
 
-// Total TLS server conns ever created (across all bursts) — SETTLED log uses
-// this to correlate the idle-heap floor with the number of conns served.
-static volatile unsigned long s_serve_conns_total = 0;
-
-unsigned long tcp_ssl_serve_conns_total() {
-  return s_serve_conns_total;
-}
-
-// Live AsyncClient shells created by the SSL serve path that have NOT been
-// deleted yet. SETTLED prints this: a value that climbs across bursts while
-// free heap ratchets down isolates per-serve object leaks (web-server request
-// objects vs our AsyncClient vs lwIP). Incremented in _serveTls on ctor
-// success, decremented in ~AsyncClient (timestamped when the object actually
-// frees), so a persistent count >0 after drain = leaked shells.
-static int s_live_serve_clients = 0;
-
-int tcp_ssl_live_serve_shells() {
-  return s_live_serve_clients;
-}
 #endif
 
 #if CONFIG_ASYNC_TCP_USE_WDT
@@ -161,6 +142,14 @@ struct tcp_core_guard {
 #ifndef CONFIG_ASYNC_TCP_POLL_TIMER
 #define CONFIG_ASYNC_TCP_POLL_TIMER 1
 #endif
+
+/* Callback context */
+struct AsyncClientCallbackContext {
+  AsyncClientCallbackContext *next = nullptr;
+  bool client_is_valid = true;
+  bool ack_later = false;
+  u16_t ack_len = 0;  // lwip's size_t
+};
 
 /*
  * TCP/IP Event Task
@@ -990,12 +979,12 @@ static tcp_pcb *_tcp_listen_with_backlog(tcp_pcb *pcb, uint8_t backlog) {
 
 AsyncClient::AsyncClient(tcp_pcb *pcb)
   : _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _server_discard_cb(0), _server_discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0), _recv_cb(0),
-    _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true), _closing(false),
+    _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _cb_ctx(nullptr),
 #if ASYNC_TCP_SSL_ENABLED
     _pcb_secure(false), _handshake_done(true), _client_ssl_ctx(NULL),
 #endif
     _tx_last_packet(0), _tx_unacked_len(0),
-    _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
+    _rx_ack_len(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
   _pcb = pcb;
   if (_pcb) {
     _rx_last_packet = millis();
@@ -1006,10 +995,10 @@ AsyncClient::AsyncClient(tcp_pcb *pcb)
 #if ASYNC_TCP_SSL_ENABLED
 AsyncClient::AsyncClient(tcp_pcb *pcb, BearSSL_SSL_CTX *ssl_ctx)
   : _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _server_discard_cb(0), _server_discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0), _recv_cb(0),
-    _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true), _closing(false),
+    _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _cb_ctx(nullptr),
     _pcb_secure(false), _handshake_done(true), _client_ssl_ctx(NULL),
     _tx_last_packet(0), _tx_unacked_len(0),
-    _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
+    _rx_ack_len(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
   _pcb = pcb;
   if (_pcb) {
     _rx_last_packet = millis();
@@ -1037,21 +1026,12 @@ AsyncClient::AsyncClient(tcp_pcb *pcb, BearSSL_SSL_CTX *ssl_ctx)
 #endif
 
 AsyncClient::~AsyncClient() {
-#if ASYNC_TCP_SSL_ENABLED
-  // The shellCLOSE probe + live-shell decrement MUST live in this (ESP8266)
-  // dtor — the copy in the ESP32 mbedTLS section never compiles here. Without
-  // the decrement, SETTLED's `shells` only ever climbs (tautology, read as a
-  // leak in an earlier session). With both, shells reveals the truth: 0 by the
-  // next SETTLED = AsyncClient freed on teardown, arena stable.
-  if (s_live_serve_clients) {
-    s_live_serve_clients--;
-  }
-  if (_server_discard_cb) {
-    async_tcp_log_d("shellCLOSE: live shells=%d", s_live_serve_clients);
-  }
-#endif
   if (_pcb) {
     _close();
+  }
+  // Inform all callbacks in the stack that this object is now destructed.
+  for (AsyncClientCallbackContext *ctx = _cb_ctx; ctx != nullptr; ctx = ctx->next) {
+    ctx->client_is_valid = false;
   }
 }
 
@@ -1240,9 +1220,7 @@ bool AsyncClient::beginSecure(const char *host, uint16_t port, const char *rootC
   _handshake_done = false;
   return connect(host, port, true);
 }
-#endif
 
-#if ASYNC_TCP_SSL_ENABLED
 bool AsyncClient::startTLS(const char *host) {
 #if ASYNC_TCP_SSL_ENABLE_CLIENT
   if (!_pcb || _pcb_secure || !connected()) {
@@ -1272,17 +1250,21 @@ bool AsyncClient::startTLS(const char *host) {
 
 void AsyncClient::close() {
   if (_pcb) {
-    _tcp_recved(&_pcb, _rx_ack_len);
+    // If we're in an onData callback, add the final packet size to the ack count
+    // before closing the connection.
+    size_t pending = _rx_ack_len;
+    _rx_ack_len = 0;
+    for (AsyncClientCallbackContext *ctx = _cb_ctx; ctx != nullptr; ctx = ctx->next) {
+      pending += ctx->ack_len;
+    }
+    if (pending) {
+      _tcp_recved(&_pcb, pending);
+    }
   }
   _close();
 }
 
 int8_t AsyncClient::abort() {
-#if ASYNC_TCP_SSL_ENABLED
-  if (_pcb_secure && _pcb) {
-    tcp_ssl_free(_pcb);
-  }
-#endif
   int8_t err = _tcp_abort(&_pcb, this);
   // _pcb is now NULL
   // LwIP invokes the error callback when abort is issued; preserve this semantic.
@@ -1296,28 +1278,7 @@ int8_t AsyncClient::abort() {
 
 size_t AsyncClient::space() const {
   if ((_pcb != NULL) && (_pcb->state == ESTABLISHED)) {
-#if ASYNC_TCP_SSL_ENABLED
-    if (_handshake_done) {
-      if (_pcb_secure) {
-        // TLS backpressure is managed by the engine's SENDAPP buffer + record
-        // ring, NOT by the raw lwIP send window. Reporting tcp_sndbuf() here
-        // collapses as the peer's receive window fills mid-stream, so a caller
-        // gating on `space() >= buffer` (e.g. chunk-inflight pacing) would stop
-        // feeding the engine and strand the tail even though the engine still
-        // has room. Report the app-side capacity (>= the ~2*MSS send buffer) so
-        // the writer keeps feeding; tcp_ssl_write()/the ring defer exert real
-        // flow control and return short when truly out of room.
-        return SSL_OUT_BUFFER_SIZE;
-      }
-      uint16_t s = tcp_sndbuf(_pcb);
-      if (s >= 128)  // safe approach
-        return s - 128;
-      return 0;
-    }
-    return 0;
-#else
     return tcp_sndbuf(_pcb);
-#endif
   }
   return 0;
 }
@@ -1387,79 +1348,44 @@ void AsyncClient::ackPacket(struct pbuf *pb) {
   pbuf_free(pb);
 }
 
+void AsyncClient::ackLater() {
+  // The loop here is of dubious necessity: the only way to get nested callbacks (at the time of this writing)
+  // is to call abort() during an onData or onPacket callback.  Calling ackLater() in that context wouldn't do
+  // anything useful.  Still we err on the side of being technically correct.
+  for (AsyncClientCallbackContext *ctx = _cb_ctx; ctx != nullptr; ctx = ctx->next) {
+    ctx->ack_later = true;
+  }
+}
+
 /*
  * Main Private Methods
  * */
 
 int8_t AsyncClient::_close() {
-  // Claim the teardown with the _closing flag: lwIP callbacks (_recv/_error)
-  // can fire synchronously inside tcp_ssl_close()/tcp_ssl_free()/tcp_close()
-  // and re-enter _close() on the same pcb; _closing makes those entry points
-  // bail. _pcb stays non-NULL until _tcp_close() nulls it.
-  if (_closing || !_pcb) {
-    return ERR_OK;
-  }
-  _closing = true;
-  tcp_pcb *pcb = _pcb;
+  // ets_printf("X: 0x%08x\n", (uint32_t)this);
 #if ASYNC_TCP_SSL_ENABLED
-  // Leak probe: shows if teardown reaches _close and whether the web hook is
-  // still wired (0/0 = web request+AsyncClient pair leaks per conn).
-  async_tcp_log_d("serveClose: discard=%d server_discard=%d pcb=%p",
-                  (int)(bool)_discard_cb, (int)(bool)_server_discard_cb, (void *)pcb);
-#endif
-#if ASYNC_TCP_SSL_ENABLED
-  if (_pcb_secure) {
-    // A hard SENDREC stall means tcp_write() cannot allocate (memp TCP_SEG /
-    // heap exhausted) — the graceful close_notify transmit below would also
-    // fail (ERR_MEM) and merely add latency while the TLS buffers stay pinned.
-    // In that exact state skip close_notify and tear the connection down
-    // immediately so its TLS buffers are returned to the heap. Graceful close
-    // is preserved for every healthy connection.
-    // ORDER MATTERS: abort the pcb FIRST — lwIP synchronously purges its
-    // queued send segments (which may reference the slab) — THEN free the TLS
-    // buffers. Freeing the slab while lwIP still drains its queue is a UAF:
-    // the next marshal copies from / chain-manipulates freed slabs, corrupting
-    // the arena (observed: force-close at free 5896 left the allocator stuck
-    // at 10528 with a lingering conn -> permanent admission-refusal latch).
-    if (tcp_ssl_is_stalled(pcb, SSL_STALL_RESET_MS)) {
-      async_tcp_log_d("_close: skipping graceful close_notify (hard stall), resetting TCP + freeing TLS buffers immediately.\n");
-      tcp_abort(pcb);
-      tcp_ssl_free(pcb);
-      _pcb = NULL;
-      _pcb_secure = false;
-      _closing = false;
-      if (_discard_cb) {
-        async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, this));
-      }
-      if (_server_discard_cb) {
-        _server_discard_cb(_server_discard_cb_arg, this);
-      }
-      // Orphan: server-created conn torn down before handshake finished — no
-      // web request ever claimed it, so nobody else frees this shell.
-      if (_server_discard_cb && !_handshake_done) { delete this; }
-      return ERR_OK;
-    } else {
-      tcp_ssl_close(pcb);  // graceful TLS shutdown: emit close_notify before FIN (best effort)
-      tcp_ssl_free(pcb);
-    }
-  }
+  // TLS teardown MUST happen while _pcb is still live: tcp_ssl_close() flushes
+  // any pending plaintext/close_notify records into the lwIP send queue, and
+  // tcp_ssl_free() returns the ~5.2KB session slab to the heap. _tcp_close()
+  // below nulls _pcb and FINs the socket; doing this the other way round drops
+  // the un-transmitted tail (truncated responses) and leaks the session.
+  tcp_ssl_close(_pcb);   // best-effort flush of pending records + close_notify
+  tcp_ssl_free(_pcb);    // free session (no-op if already freed)
 #endif
   int8_t err = _tcp_close(&_pcb, this);
   // _pcb is now NULL
-  _closing = false;
   if ((err == ERR_OK) && _discard_cb) {
     // _pcb was closed here
     async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, this));
   }
-  if (_server_discard_cb) {
+#if ASYNC_TCP_SSL_ENABLED
+  // Fires _server_discard_cb (AsyncServer's instant-slot-promote hook) on the
+  // graceful-close path, matching _error() above. Without it a live conn that
+  // closes normally never triggers _conn_done/_promoteSlot, so a parked conn
+  // waits for the next 1s _poll tick instead of promoting immediately.
+  if ((err == ERR_OK) && _server_discard_cb) {
     _server_discard_cb(_server_discard_cb_arg, this);
   }
-#if ASYNC_TCP_SSL_ENABLED
-  // Pre-handshake death: `new AsyncClient` in _serveTls was never claimed by a
-  // web request (_discard_cb NULL), so _close/_error alone leak one shell per
-  // failed conn. Free it. Claimed conns have _handshake_done set (no-op) and
-  // client-role conns have no _server_discard_cb (no-op).
-  if (_server_discard_cb && !_handshake_done) { delete this; }
 #endif
   return err;
 }
@@ -1468,7 +1394,7 @@ int8_t AsyncClient::_close() {
  * Private Callbacks
  * */
 
-int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err __attribute__((unused))) {
+int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
   _pcb = reinterpret_cast<tcp_pcb *>(pcb);
   if (_pcb) {
     _rx_last_packet = millis();
@@ -1501,18 +1427,29 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err __attribute__((unused)))
   return ERR_OK;
 }
 
-void AsyncClient::_error(int8_t err) {
-  if (_pcb) {
-#if ASYNC_TCP_SSL_ENABLED
-    if (_pcb_secure) {
-      tcp_ssl_free(_pcb);
-    }
+// In LwIP Thread
+// Disable the "dangling pointer" warning for these calls.
+// We store a pointer to a stack local AsyncClientCallbackContext in the AsyncClient object over the context of the function
+// call to track if the object was destroyed.  If so, we do not reset the pointer, which GCC identifies as a possible
+// dangling reference case.  It is not - the reference was destroyed along with the AsyncClient object.
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ >= 12)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
 #endif
-    _pcb = NULL;
-  }
+
+void AsyncClient::_error(int8_t err) {
+  AsyncClientCallbackContext ctx;
+  ctx.next = _cb_ctx;
+  _cb_ctx = &ctx;
   if (_error_cb) {
     async_tcp_log_elapsed("onError", _error_cb(_error_cb_arg, this, err));
   }
+  // Early exit if the error callback destructed our object.
+  // Discard callback is already destroyed, so we cannot call it; so just return.
+  if (!ctx.client_is_valid) {
+    return;
+  }
+  _cb_ctx = ctx.next;
   if (_discard_cb) {
     async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, this));
   }
@@ -1564,27 +1501,13 @@ void AsyncClient::_s_ssl_error(void *arg, struct tcp_pcb *tcp, int8_t err) {
 }
 #endif
 
-// In LwIP Thread
-int8_t AsyncClient::_lwip_fin(tcp_pcb *pcb, int8_t err __attribute__((unused))) {
-  if (!_pcb || pcb != _pcb) {
-    async_tcp_log_d("0x%08" PRIx32 " != 0x%08" PRIx32, (uint32_t)pcb, (uint32_t)_pcb);
-    return ERR_OK;
-  }
-  _reset_tcp_callbacks(_pcb, this);
-  if (tcp_close(_pcb) != ERR_OK) {
-    tcp_abort(_pcb);
-  }
-  _pcb = NULL;
-  return ERR_OK;
-}
-
 // In Async Thread
-int8_t AsyncClient::_fin(tcp_pcb *pcb __attribute__((unused)), int8_t err __attribute__((unused))) {
+int8_t AsyncClient::_fin(tcp_pcb *pcb, int8_t err) {
   close();
   return ERR_OK;
 }
 
-int8_t AsyncClient::_sent(tcp_pcb *pcb __attribute__((unused)), uint16_t len) {
+int8_t AsyncClient::_sent(tcp_pcb *pcb, uint16_t len) {
 #if ASYNC_TCP_SSL_ENABLED
   if (_pcb_secure) {
     // TLS-layer ACK handling must run for EVERY ciphertext ACK, INCLUDING
@@ -1607,13 +1530,8 @@ int8_t AsyncClient::_sent(tcp_pcb *pcb __attribute__((unused)), uint16_t len) {
   return ERR_OK;
 }
 
-int8_t AsyncClient::_recv(tcp_pcb *pcb __attribute__((unused)), pbuf *pb, int8_t err __attribute__((unused))) {
-  // A teardown is in flight for this client (close/abort running on the lwIP
-  // pcb). Late synchronous callbacks would resurrect _pcb and tear the pcb
-  // down twice -> use-after-free. Bail so the claiming _close() owns it.
-  if (_closing) {
-    return ERR_OK;
-  }
+int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
+  AsyncClientCallbackContext ctx;
 #if ASYNC_TCP_SSL_ENABLED
   if (_pcb_secure) {
     if (pb == NULL) {
@@ -1636,29 +1554,51 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb __attribute__((unused)), pbuf *pb, int8_t
     return ERR_OK;
   }
 #endif
+  ctx.next = _cb_ctx;
+  _cb_ctx = &ctx;
   while (pb != NULL) {
     _rx_last_packet = millis();
     // we should not ack before we assimilate the data
-    _ack_pcb = true;
+    ctx.ack_later = false;
     pbuf *b = pb;
-    pb = b->next;
+    pb = pb->next;
     b->next = NULL;
     if (_pb_cb) {
       async_tcp_log_elapsed("onPacket", _pb_cb(_pb_cb_arg, this, b));
+      // Break if object was destructed or pcb closed
+      if ((!ctx.client_is_valid) || (!_pcb)) {
+        break;
+      }
     } else {
       if (_recv_cb) {
         async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, b->payload, b->len));
       }
-      if (!_ack_pcb) {
-        _rx_ack_len += b->len;
-      } else if (_pcb) {
-        _tcp_recved(&_pcb, b->len);
-      }
+      ctx.ack_len = b->len;
       pbuf_free(b);
+      // Break if object was destructed or pcb closed
+      if ((!ctx.client_is_valid) || (!_pcb)) {
+        break;
+      }
+      if (ctx.ack_later == false) {
+        _tcp_recved(&_pcb, ctx.ack_len);
+      } else {
+        _rx_ack_len += ctx.ack_len;
+      }
+      ctx.ack_len = 0;
     }
+  }
+  if (pb) {
+    pbuf_free(pb);  // Release any un-processed pbufs if the client was invalidated during callbacks
+  }
+  if (ctx.client_is_valid) {
+    _cb_ctx = ctx.next;
   }
   return ERR_OK;
 }
+
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ >= 12)
+#pragma GCC diagnostic pop
+#endif
 
 int8_t AsyncClient::_poll(tcp_pcb *pcb) {
   if (!_pcb) {
@@ -1765,12 +1705,7 @@ void AsyncClient::_dns_found(ip_addr_t *ipaddr) {
     connect(*ipaddr, _connect_port);
 #endif
   } else {
-    if (_error_cb) {
-      async_tcp_log_elapsed("onError", _error_cb(_error_cb_arg, this, -55));
-    }
-    if (_discard_cb) {
-      async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, this));
-    }
+    _error(-55);
   }
 }
 
@@ -2237,7 +2172,7 @@ void AsyncServer::end() {
 }
 
 // runs on LwIP thread
-err_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, err_t err __attribute__((unused))) {
+err_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, err_t err) {
   if (!pcb) {
     async_tcp_log_e("_accept failed: pcb is NULL");
     return ERR_ABRT;
@@ -2427,8 +2362,6 @@ AsyncClient *AsyncServer::_serveTls(tcp_pcb *pcb) {
   }
   AsyncClient *c = new (std::nothrow) AsyncClient(pcb, _ssl_ctx);
   if (c) {
-    s_live_serve_clients++;
-    s_serve_conns_total++;
     if (!c->_pcb) {
       // Ctor could not init the TLS engine (heap allocation failed) and
       // already closed the pcb. Drop the empty shell — this both avoids a
@@ -2845,6 +2778,14 @@ struct tcp_core_guard {
 #define CONFIG_ASYNC_TCP_POLL_TIMER 1
 #endif
 
+/* Callback context */
+struct AsyncClientCallbackContext {
+  AsyncClientCallbackContext *next = nullptr;
+  bool client_is_valid = true;
+  bool ack_later = false;
+  u16_t ack_len = 0;  // lwip's size_t
+};
+
 /*
  * TCP/IP Event Task
  * */
@@ -2977,11 +2918,6 @@ static inline void _prepend_async_event(lwip_tcp_event_packet_t *e) {
   xTaskNotifyGive(_async_service_task_handle);
 }
 #else
-
-namespace {
-  // No-op guard class
-  class queue_mutex_guard {} __attribute__((unused));
-}  // anonymous namespace
 
 static void _process_async_event();
 
@@ -3684,8 +3620,8 @@ static tcp_pcb *_tcp_listen_with_backlog(tcp_pcb *pcb, uint8_t backlog) {
 
 AsyncClient::AsyncClient(tcp_pcb *pcb)
   : _connect_cb(0), _connect_cb_arg(0), _discard_cb(0), _discard_cb_arg(0), _sent_cb(0), _sent_cb_arg(0), _error_cb(0), _error_cb_arg(0), _recv_cb(0),
-    _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _ack_pcb(true), _tx_last_packet(0),
-    _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
+    _recv_cb_arg(0), _pb_cb(0), _pb_cb_arg(0), _timeout_cb(0), _timeout_cb_arg(0), _poll_cb(0), _poll_cb_arg(0), _cb_ctx(nullptr), _tx_last_packet(0),
+    _rx_ack_len(0), _rx_timeout(0), _rx_last_ack(0), _ack_timeout(CONFIG_ASYNC_TCP_MAX_ACK_TIME), _connect_port(0) {
   _pcb = pcb;
 #if ASYNC_TCP_SSL_ENABLED
   _secure = nullptr;
@@ -3718,6 +3654,10 @@ AsyncClient::~AsyncClient() {
 #endif
   if (_pcb) {
     _close();
+  }
+  // Inform all callbacks in the stack that this object is now destructed.
+  for (AsyncClientCallbackContext *ctx = _cb_ctx; ctx != nullptr; ctx = ctx->next) {
+    ctx->client_is_valid = false;
   }
 }
 
@@ -3971,7 +3911,16 @@ bool AsyncClient::connect(const char *host, uint16_t port) {
 
 void AsyncClient::close() {
   if (_pcb) {
-    _tcp_recved(&_pcb, _rx_ack_len);
+    // If we're in an onData callback, add the final packet size to the ack count
+    // before closing the connection.
+    size_t pending = _rx_ack_len;
+    _rx_ack_len = 0;
+    for (AsyncClientCallbackContext *ctx = _cb_ctx; ctx != nullptr; ctx = ctx->next) {
+      pending += ctx->ack_len;
+    }
+    if (pending) {
+      _tcp_recved(&_pcb, pending);
+    }
   }
   _close();
 }
@@ -4051,6 +4000,15 @@ void AsyncClient::ackPacket(struct pbuf *pb) {
   pbuf_free(pb);
 }
 
+void AsyncClient::ackLater() {
+  // The loop here is of dubious necessity: the only way to get nested callbacks (at the time of this writing)
+  // is to call abort() during an onData or onPacket callback.  Calling ackLater() in that context wouldn't do
+  // anything useful.  Still we err on the side of being technically correct.
+  for (AsyncClientCallbackContext *ctx = _cb_ctx; ctx != nullptr; ctx = ctx->next) {
+    ctx->ack_later = true;
+  }
+}
+
 /*
  * Main Private Methods
  * */
@@ -4075,7 +4033,7 @@ int8_t AsyncClient::_close() {
  * Private Callbacks
  * */
 
-int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err __attribute__((unused))) {
+int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err) {
   _pcb = reinterpret_cast<tcp_pcb *>(pcb);
   if (_pcb) {
     _rx_last_packet = millis();
@@ -4161,10 +4119,29 @@ int8_t AsyncClient::_connected(tcp_pcb *pcb, int8_t err __attribute__((unused)))
   return ERR_OK;
 }
 
+// In LwIP Thread
+// Disable the "dangling pointer" warning for these calls.
+// We store a pointer to a stack local AsyncClientCallbackContext in the AsyncClient object over the context of the function
+// call to track if the object was destroyed.  If so, we do not reset the pointer, which GCC identifies as a possible
+// dangling reference case.  It is not - the reference was destroyed along with the AsyncClient object.
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ >= 12)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
+
 void AsyncClient::_error(int8_t err) {
+  AsyncClientCallbackContext ctx;
+  ctx.next = _cb_ctx;
+  _cb_ctx = &ctx;
   if (_error_cb) {
     async_tcp_log_elapsed("onError", _error_cb(_error_cb_arg, this, err));
   }
+  // Early exit if the error callback destructed our object.
+  // Discard callback is already destroyed, so we cannot call it; so just return.
+  if (!ctx.client_is_valid) {
+    return;
+  }
+  _cb_ctx = ctx.next;
   if (_discard_cb) {
     async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, this));
   }
@@ -4175,27 +4152,13 @@ void AsyncClient::_error(int8_t err) {
 #endif
 }
 
-// In LwIP Thread
-int8_t AsyncClient::_lwip_fin(tcp_pcb *pcb, int8_t err __attribute__((unused))) {
-  if (!_pcb || pcb != _pcb) {
-    async_tcp_log_d("0x%08" PRIx32 " != 0x%08" PRIx32, (uint32_t)pcb, (uint32_t)_pcb);
-    return ERR_OK;
-  }
-  _reset_tcp_callbacks(_pcb, this);
-  if (tcp_close(_pcb) != ERR_OK) {
-    tcp_abort(_pcb);
-  }
-  _pcb = NULL;
-  return ERR_OK;
-}
-
 // In Async Thread
-int8_t AsyncClient::_fin(tcp_pcb *pcb __attribute__((unused)), int8_t err __attribute__((unused))) {
+int8_t AsyncClient::_fin(tcp_pcb *pcb, int8_t err) {
   close();
   return ERR_OK;
 }
 
-int8_t AsyncClient::_sent(tcp_pcb *pcb __attribute__((unused)), uint16_t len) {
+int8_t AsyncClient::_sent(tcp_pcb *pcb, uint16_t len) {
   _rx_last_ack = _rx_last_packet = millis();
   if (_sent_cb) {
     async_tcp_log_elapsed("onAck", _sent_cb(_sent_cb_arg, this, len, (_rx_last_packet - _tx_last_packet)));
@@ -4203,9 +4166,12 @@ int8_t AsyncClient::_sent(tcp_pcb *pcb __attribute__((unused)), uint16_t len) {
   return ERR_OK;
 }
 
-int8_t AsyncClient::_recv(tcp_pcb *pcb __attribute__((unused)), pbuf *pb, int8_t err __attribute__((unused))) {
+int8_t AsyncClient::_recv(tcp_pcb *pcb, pbuf *pb, int8_t err) {
+  AsyncClientCallbackContext ctx;
 #if ASYNC_TCP_SSL_ENABLED
   if (_secure) {
+    ctx.next = _cb_ctx;
+    _cb_ctx = &ctx;
     size_t fed = _secure->feedRx(pb);
     if (fed > 0 && _pcb) {
       _tcp_recved(&_pcb, fed);
@@ -4218,6 +4184,9 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb __attribute__((unused)), pbuf *pb, int8_t
         if (_connect_cb) {
           async_tcp_log_elapsed("onConnect", _connect_cb(_connect_cb_arg, this));
         }
+        if (!ctx.client_is_valid) {
+          return ERR_OK;  // client destructed in onConnect
+        }
       } else if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) {
         // Still in progress, wait for more data
       } else {
@@ -4227,8 +4196,8 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb __attribute__((unused)), pbuf *pb, int8_t
         _secure = nullptr;
         _clearSSLParams();
         if (_error_cb) { _error_cb(_error_cb_arg, this, -60); }
-        if (_discard_cb) { _discard_cb(_discard_cb_arg, this); }
-        if (_server_discard_cb) { _server_discard_cb(_server_discard_cb_arg, this); }
+        if (ctx.client_is_valid && _discard_cb) { _discard_cb(_discard_cb_arg, this); }
+        if (ctx.client_is_valid && _server_discard_cb) { _server_discard_cb(_server_discard_cb_arg, this); }
       }
     } else {
       uint8_t buf[1024];
@@ -4237,34 +4206,62 @@ int8_t AsyncClient::_recv(tcp_pcb *pcb __attribute__((unused)), pbuf *pb, int8_t
         if (_recv_cb) {
           async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, (char *)buf, n));
         }
+        if (!ctx.client_is_valid) {
+          return ERR_OK;  // client destructed in onData; do not touch _secure/this again
+        }
       }
+    }
+    if (ctx.client_is_valid) {
+      _cb_ctx = ctx.next;
     }
     return ERR_OK;
   }
 #endif
+  ctx.next = _cb_ctx;
+  _cb_ctx = &ctx;
   while (pb != NULL) {
     _rx_last_packet = millis();
     // we should not ack before we assimilate the data
-    _ack_pcb = true;
+    ctx.ack_later = false;
     pbuf *b = pb;
-    pb = b->next;
+    pb = pb->next;
     b->next = NULL;
     if (_pb_cb) {
       async_tcp_log_elapsed("onPacket", _pb_cb(_pb_cb_arg, this, b));
+      // Break if object was destructed or pcb closed
+      if ((!ctx.client_is_valid) || (!_pcb)) {
+        break;
+      }
     } else {
       if (_recv_cb) {
         async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, b->payload, b->len));
       }
-      if (!_ack_pcb) {
-        _rx_ack_len += b->len;
-      } else if (_pcb) {
-        _tcp_recved(&_pcb, b->len);
-      }
+      ctx.ack_len = b->len;
       pbuf_free(b);
+      // Break if object was destructed or pcb closed
+      if ((!ctx.client_is_valid) || (!_pcb)) {
+        break;
+      }
+      if (ctx.ack_later == false) {
+        _tcp_recved(&_pcb, ctx.ack_len);
+      } else {
+        _rx_ack_len += ctx.ack_len;
+      }
+      ctx.ack_len = 0;
     }
+  }
+  if (pb) {
+    pbuf_free(pb);  // Release any un-processed pbufs if the client was invalidated during callbacks
+  }
+  if (ctx.client_is_valid) {
+    _cb_ctx = ctx.next;
   }
   return ERR_OK;
 }
+
+#if defined(__GNUC__) && !defined(__clang__) && (__GNUC__ >= 12)
+#pragma GCC diagnostic pop
+#endif
 
 int8_t AsyncClient::_poll(tcp_pcb *pcb) {
   if (!_pcb) {
@@ -4279,12 +4276,21 @@ int8_t AsyncClient::_poll(tcp_pcb *pcb) {
   uint32_t now = millis();
 #if ASYNC_TCP_SSL_ENABLED
   if (_secure && !_ssl_handshake_done) {
+    AsyncClientCallbackContext ctx;
+    ctx.next = _cb_ctx;
+    _cb_ctx = &ctx;
     if ((now - _rx_last_packet) > _ssl_timeout) {
       async_tcp_log_e("SSL handshake timeout");
       if (_error_cb) {
         _error_cb(_error_cb_arg, this, -61);
       }
+      if (!ctx.client_is_valid) {
+        return ERR_OK;  // client destructed in onError
+      }
       _close();
+      if (ctx.client_is_valid) {
+        _cb_ctx = ctx.next;
+      }
       return ERR_OK;
     }
     int ret = _secure->runSSLHandshake();
@@ -4302,18 +4308,30 @@ async_tcp_log_e("SSL handshake failed in _poll: %d", ret);
       if (_error_cb) {
         async_tcp_log_elapsed("onError", _error_cb(_error_cb_arg, this, -60));
       }
+      if (!ctx.client_is_valid) {
+        return ERR_OK;  // client destructed in onError
+      }
       _close();
+    }
+    if (ctx.client_is_valid) {
+      _cb_ctx = ctx.next;
     }
     return ERR_OK;
   }
 
   // Process pending SSL pbufs — drain BIO buffer first, then feed held chain
   if (_secure && _ssl_handshake_done) {
+    AsyncClientCallbackContext ctx;
+    ctx.next = _cb_ctx;
+    _cb_ctx = &ctx;
     uint8_t buf[1024];
     int n;
     while ((n = _secure->sslRead(buf, sizeof(buf))) > 0) {
       if (_recv_cb) {
         async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, (char *)buf, n));
+      }
+      if (!ctx.client_is_valid) {
+        return ERR_OK;  // client destructed in onData; do not touch _secure/this again
       }
     }
     size_t fed = _secure->feedRx(NULL);
@@ -4324,6 +4342,12 @@ async_tcp_log_e("SSL handshake failed in _poll: %d", ret);
       if (_recv_cb) {
         async_tcp_log_elapsed("onData", _recv_cb(_recv_cb_arg, this, (char *)buf, n));
       }
+      if (!ctx.client_is_valid) {
+        return ERR_OK;  // client destructed in onData; do not touch _secure/this again
+      }
+    }
+    if (ctx.client_is_valid) {
+      _cb_ctx = ctx.next;
     }
     return ERR_OK;
   }
@@ -4360,12 +4384,7 @@ void AsyncClient::_dns_found(ip_addr_t *ipaddr) {
   if (ipaddr) {
     connect(*ipaddr, _connect_port);
   } else {
-    if (_error_cb) {
-      async_tcp_log_elapsed("onError", _error_cb(_error_cb_arg, this, -55));
-    }
-    if (_discard_cb) {
-      async_tcp_log_elapsed("onDisconnect", _discard_cb(_discard_cb_arg, this));
-    }
+    _error(-55);
   }
 }
 
@@ -4806,7 +4825,7 @@ void AsyncServer::end() {
 }
 
 // runs on LwIP thread
-err_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, err_t err __attribute__((unused))) {
+err_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, err_t err) {
   if (!pcb) {
     async_tcp_log_e("_accept failed: pcb is NULL");
     return ERR_ABRT;

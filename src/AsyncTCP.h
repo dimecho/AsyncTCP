@@ -86,6 +86,7 @@ typedef std::function<void(void *, AsyncClient *, uint32_t time)> AcTimeoutHandl
 
 struct tcp_pcb;
 class AsyncTCP_detail;
+struct AsyncClientCallbackContext;
 struct pending_pcb;
 
 #if defined(ESP8266)   // ---------------- ESP8266 + BearSSL -------------
@@ -135,20 +136,6 @@ public:
   bool startTLS(const char *host = "");
   bool beginSecure(const char *host, uint16_t port, const char *rootCA = NULL);
 #endif
-
-  /**
-     * @brief close connection
-     *
-     * @param now - ignored
-     */
-  [[deprecated("Use AsyncClient::close() instead")]]
-  void close(bool now __attribute__((unused))) {
-    close();
-  }
-  [[deprecated("Use AsyncClient::close() instead")]]
-  void stop() {
-    close();
-  };
 
   /**
      * @brief close connection
@@ -292,9 +279,7 @@ public:
   // ack data that you have not acked using the method below
   size_t ack(size_t len);
   // will not ack the current packet. Call from onData
-  void ackLater() {
-    _ack_pcb = false;
-  }
+  void ackLater();
 
   static const char *errorToString(int8_t error);
   const char *stateToString() const;
@@ -328,14 +313,14 @@ protected:
   void *_timeout_cb_arg;
   AcConnectHandler _poll_cb;
   void *_poll_cb_arg;
-
-  bool _ack_pcb;
-  bool _closing;
+  
 #if ASYNC_TCP_SSL_ENABLED
   bool _pcb_secure;
   bool _handshake_done;
   BearSSL_SSL_CTX *_client_ssl_ctx;
 #endif
+
+  AsyncClientCallbackContext *_cb_ctx;
   uint32_t _tx_last_packet;
   uint32_t _tx_unacked_len;
   uint32_t _rx_ack_len;
@@ -365,7 +350,6 @@ protected:
   int8_t _poll(tcp_pcb *pcb);
   int8_t _sent(tcp_pcb *pcb, uint16_t len);
   int8_t _fin(tcp_pcb *pcb, int8_t err);
-  int8_t _lwip_fin(tcp_pcb *pcb, int8_t err);
   void _dns_found(ip_addr_t *ipaddr);
 
 #if ASYNC_TCP_SSL_ENABLED
@@ -619,9 +603,7 @@ public:
   // ack data that you have not acked using the method below
   size_t ack(size_t len);
   // will not ack the current packet. Call from onData
-  void ackLater() {
-    _ack_pcb = false;
-  }
+  void ackLater();
 
   static const char *errorToString(int8_t error);
   const char *stateToString() const;
@@ -676,7 +658,7 @@ protected:
   AcConnectHandler _poll_cb;
   void *_poll_cb_arg;
 
-  bool _ack_pcb;
+  AsyncClientCallbackContext *_cb_ctx;
   uint32_t _tx_last_packet;
   uint32_t _rx_ack_len;
   uint32_t _rx_last_packet;
@@ -691,7 +673,6 @@ protected:
   int8_t _poll(tcp_pcb *pcb);
   int8_t _sent(tcp_pcb *pcb, uint16_t len);
   int8_t _fin(tcp_pcb *pcb, int8_t err);
-  int8_t _lwip_fin(tcp_pcb *pcb, int8_t err);
   void _dns_found(ip_addr_t *ipaddr);
 #if ASYNC_TCP_SSL_ENABLED
   AsyncSecureSession *_secure;       // replaces pre-refactor _ssl_ctx

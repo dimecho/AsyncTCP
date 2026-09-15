@@ -398,10 +398,7 @@ uint8_t tcp_ssl_has_client();
 uint8_t tcp_ssl_client_count();
 uint8_t tcp_ssl_server_handshake_busy();
 uint8_t tcp_ssl_parked_count();
-// Diagnostics for the SETTLED log.
-unsigned long tcp_ssl_serve_conns_total();
 void tcp_ssl_shed_parked();  // flush the parked queue at the next idle tick
-int tcp_ssl_live_serve_shells();  // live AsyncClient shells (leak finder)
 #endif
 
 void tcp_ssl_arg(struct tcp_pcb* pcb, void* arg);

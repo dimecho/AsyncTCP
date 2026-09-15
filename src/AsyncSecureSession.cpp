@@ -289,10 +289,10 @@ int tcp_ssl_free(struct tcp_pcb* pcb) {
         // All TLS conns drained: print the true idle floor, then flush the
         // parked queue (parked pcbs pin prior page's pbuf chains, holding free
         // heap below the bar).
-        async_tcp_log_i("SETTLED: conns=%lu, parked=%u, free heap=%u, maxblock=%u, frag=%u%%, shells=%d\n",
-                        tcp_ssl_serve_conns_total(), tcp_ssl_parked_count(),
+        async_tcp_log_i("SETTLED: parked=%u, free heap=%u, maxblock=%u, frag=%u%%\n",
+                        tcp_ssl_parked_count(),
                         (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize(),
-                        (unsigned)ESP.getHeapFragmentation(), tcp_ssl_live_serve_shells());
+                        (unsigned)ESP.getHeapFragmentation());
         tcp_ssl_shed_parked();
       }
       return 0;
@@ -339,7 +339,7 @@ size_t tcp_ssl_close(struct tcp_pcb* pcb) {
   // Drain any SENDREC record deferred earlier (tcp_write blocked on a full
   // window). Still pending in the engine (not acked); if the window
   // has room now, push it before the close_notify so no response tail is cut.
-  if (ssl_pcb->sendrec_deferred && (br_ssl_engine_current_state(eng) & BR_SSL_SENDREC)) {
+  if (br_ssl_engine_current_state(eng) & BR_SSL_SENDREC) {
     size_t plen = 0;
     unsigned char* pbuf = br_ssl_engine_sendrec_buf(eng, &plen);
     if (pbuf && plen && plen <= SSL_OUT_BUFFER_SIZE) {
@@ -754,6 +754,10 @@ int tcp_ssl_write(struct tcp_pcb* pcb, const uint8_t* data, size_t len) {
 
   unsigned int state = br_ssl_engine_current_state(eng);
   if (!(state & BR_SSL_SENDAPP)) {
+    // Engine not accepting app data (SENDREC/RECVREC mid-record). Re-arm so the
+    // writer is woken once it cycles back to SENDAPP instead of stalling until
+    // the next poll tick.
+    schedule_ssl_engine(ssl_pcb);
     return 0;
   }
 
@@ -767,7 +771,7 @@ int tcp_ssl_write(struct tcp_pcb* pcb, const uint8_t* data, size_t len) {
   size_t clen = (len > wlen) ? wlen : len;
   memcpy(buf, data, clen);
   br_ssl_engine_sendapp_ack(eng, clen);
-  br_ssl_engine_flush(eng, 1);  // force=0 withheld partial records (response tail stranded in WAIT_ACK forever)
+  br_ssl_engine_flush(eng, 0);
   schedule_ssl_engine(ssl_pcb);
   return clen;
 }
