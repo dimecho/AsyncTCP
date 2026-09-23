@@ -5,12 +5,15 @@
 //   - ESP8266         -> BearSSL stack (AsyncTCP fork, NO_SYS lwIP)
 //   - ESP32/LIBRETINY -> mbedTLS stack (AsyncTCP ESP32Async base)
 // Selected at compile time via #if defined(ESP8266). Only one stack compiles per target.
+
+#include "AsyncTCP.h"
+#include "AsyncSecureSession.h"
+#include "AsyncTCPCoreGuard.h"  // tcp_core_guard (core-lock required lwIP handler calls)
+
 #if defined(ESP8266)
 // ===== begin BearSSL/ESP8266 (AsyncTCP) =====
 /* BearSSL bridge: single TU for client+server, role-agnostic core, engine pump,
    MFLN paths, PROGMEM certs, NULL checks, StackThunk stack. */
-
-#include "AsyncSecureSession.h"
 
 // When ASYNC_TCP_SSL_ENABLED is 0, this entire file compiles to nothing.
 // Keeps BearSSL types out of non-SSL builds, which would corrupt the heap
@@ -286,6 +289,7 @@ int tcp_ssl_free(struct tcp_pcb* pcb) {
       delete iter;
       async_tcp_log_d("FREE: free heap=%u\n", (unsigned)ESP.getFreeHeap());
       if (!tcp_ssl_pcbs) {
+#if ASYNC_TCP_SSL_ENABLE_SERVER
         // All TLS conns drained: print the true idle floor, then flush the
         // parked queue (parked pcbs pin prior page's pbuf chains, holding free
         // heap below the bar).
@@ -294,6 +298,7 @@ int tcp_ssl_free(struct tcp_pcb* pcb) {
                         (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize(),
                         (unsigned)ESP.getHeapFragmentation());
         tcp_ssl_shed_parked();
+#endif
       }
       return 0;
     }
@@ -807,8 +812,6 @@ int tcp_ssl_read(struct tcp_pcb* pcb, struct pbuf* pb) {
 
 // --- Callback and state management functions ---
 
-bool tcp_ssl_has(struct tcp_pcb* pcb) { return find_ssl_pcb(pcb) != nullptr; }
-
 bool tcp_ssl_tx_busy(struct tcp_pcb* pcb) {
   tcp_ssl_pcb* ssl_pcb = find_ssl_pcb(pcb);
   if (!ssl_pcb) return false;
@@ -1133,7 +1136,7 @@ static std::unique_ptr<char[]> normalize_pem(const char* src, const char*& out) 
 #if ASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD
 // BearSSL's br_skey_decoder only parses *unencrypted* private keys, so the
 // server-side password of beginSecure(cert, key, password) used to be ignored
-// on ESP8266 (the TLS glue just did `(void)password`). OpenSSL's
+// on ESP8266 (the TLS layer just did `(void)password`). OpenSSL's
 // "ENCRYPTED PRIVATE KEY" PEM is a PKCS#8 EncryptedPrivateKeyInfo (RFC 5958)
 // wrapped in PBES2 (RFC 8018). Decrypt it here with BearSSL's own primitives
 // (PBKDF2-HMAC over SHA1/SHA256 + AES-CBC or DES-EDE3-CBC), then hand the
@@ -1696,13 +1699,6 @@ int tcp_ssl_new_server(struct tcp_pcb* pcb, BearSSL_SSL_CTX* ssl_ctx) {
   return 0;
 }
 
-uint8_t tcp_ssl_has_client() {
-  for (tcp_ssl_pcb* iter = tcp_ssl_pcbs; iter; iter = iter->next) {
-    if (iter->is_server) return 1;
-  }
-  return 0;
-}
-
 uint8_t tcp_ssl_client_count() {
   uint8_t n = 0;
   for (tcp_ssl_pcb* iter = tcp_ssl_pcbs; iter; iter = iter->next) {
@@ -1711,20 +1707,168 @@ uint8_t tcp_ssl_client_count() {
   return n;
 }
 
-// Is any server session still mid-handshake? The parked queue's ClientHello
-// pbufs rob a RUNNING handshake's heap, so admission needs to know which
-// phase the (single, SSL_MAX_CONNECTIONS=1) live serve conn is in. No
-// dedicated flag — reuse ssl_pcb->handshake_done, the session's own
-// handshake-complete bit (single source of truth, auto-cleared on teardown by
-// tcp_ssl_free list removal).
-uint8_t tcp_ssl_server_handshake_busy() {
-  for (tcp_ssl_pcb* iter = tcp_ssl_pcbs; iter; iter = iter->next) {
-    if (iter->is_server && !iter->handshake_done) return 1;
+#endif  // ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_SERVER
+
+#if ASYNC_TCP_SSL_ENABLED
+// ---- ESP8266 AsyncSecureSession: owns the tcp_ssl_pcb and its lwIP callbacks ----
+
+AsyncSecureSession::AsyncSecureSession(void)
+    : _pcb(NULL), _ssl(NULL), _handshake_done(false),
+      _deferred_host(NULL), _deferred_ssl_ctx(NULL),
+      _on_data_cb(NULL), _on_data_arg(NULL),
+      _on_handshake_cb(NULL), _on_handshake_arg(NULL),
+      _on_error_cb(NULL), _on_error_arg(NULL) {
+}
+
+AsyncSecureSession::~AsyncSecureSession() {
+  if (_deferred_host) { free(_deferred_host); _deferred_host = NULL; }
+  if (_ssl) {
+    if (_pcb) {
+      tcp_ssl_close(_pcb);  // best-effort flush + close_notify
+      tcp_ssl_free(_pcb);   // return the session slab
+    }
+    _ssl = NULL;
   }
+  _pcb = NULL;
+}
+
+int AsyncSecureSession::startSSLClient(tcp_pcb* pcb, const char* host, BearSSL_SSL_CTX* ssl_ctx) {
+  if (!pcb) return -1;
+  _pcb = pcb;
+  if (tcp_ssl_new_client(pcb, host ? host : "", NULL, ssl_ctx) < 0) {
+    _pcb = NULL;
+    return -1;
+  }
+  _ssl = find_ssl_pcb(pcb);
+  _handshake_done = false;
+  tcp_ssl_arg(pcb, this);
+  tcp_ssl_data(pcb, &AsyncSecureSession::_s_data);
+  tcp_ssl_handshake(pcb, &AsyncSecureSession::_s_handshake);
+  tcp_ssl_err(pcb, &AsyncSecureSession::_s_ssl_error);
   return 0;
 }
 
-#endif  // ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_SERVER
+int AsyncSecureSession::startSSLServer(tcp_pcb* pcb, BearSSL_SSL_CTX* ssl_ctx) {
+  if (!pcb || !ssl_ctx) return -1;
+  _pcb = pcb;
+  if (tcp_ssl_new_server(pcb, ssl_ctx) < 0) {
+    _pcb = NULL;
+    return -1;
+  }
+  _ssl = find_ssl_pcb(pcb);
+  _handshake_done = false;
+  tcp_ssl_arg(pcb, this);
+  tcp_ssl_data(pcb, &AsyncSecureSession::_s_data);
+  tcp_ssl_handshake(pcb, &AsyncSecureSession::_s_handshake);
+  tcp_ssl_err(pcb, &AsyncSecureSession::_s_ssl_error);
+  return 0;
+}
+
+void AsyncSecureSession::setClientCredentials(const char* host, BearSSL_SSL_CTX* ssl_ctx) {
+  if (_deferred_host) { free(_deferred_host); _deferred_host = NULL; }
+  _deferred_host = host ? strdup(host) : NULL;
+  _deferred_ssl_ctx = ssl_ctx;
+}
+
+int AsyncSecureSession::startClient(tcp_pcb* pcb) {
+  if (!pcb) return -1;
+  return startSSLClient(pcb, _deferred_host ? _deferred_host : "", _deferred_ssl_ctx);
+}
+
+int AsyncSecureSession::feedRx(pbuf* pb) {
+  if (!_ssl || !_pcb) return -1;
+  int read_bytes = tcp_ssl_read(_pcb, pb);
+  if (read_bytes < 0) {
+    if (read_bytes != BR_ALERT_CLOSE_NOTIFY) {
+      return read_bytes;
+    }
+    _handshake_done = true;
+    return 0;
+  }
+  _handshake_done = true;  // BearSSL delivers app data only post-handshake
+  return read_bytes;
+}
+
+bool AsyncSecureSession::feedRxData(const unsigned char* data, size_t len) {
+  // BearSSL is pbuf-driven (no separate raw BIO feed); queue via the engine's
+  // recv path is not applicable. Treated as a no-op success for API parity.
+  (void)data; (void)len;
+  return true;
+}
+
+int AsyncSecureSession::write(const uint8_t* data, size_t len) {
+  if (!_pcb) return -1;
+  int sent = tcp_ssl_write(_pcb, data, len);
+  return sent >= 0 ? sent : -1;
+}
+
+void AsyncSecureSession::sentAck(size_t acked) {
+  if (_pcb) tcp_ssl_sent(_pcb, acked);
+}
+
+int AsyncSecureSession::pump(void) {
+  if (!_ssl) return -1;
+  process_ssl_engine(_ssl);
+  return _handshake_done ? 0 : -1;
+}
+
+bool AsyncSecureSession::isStalled(uint32_t stall_ms) {
+  return _pcb ? tcp_ssl_is_stalled(_pcb, stall_ms) : false;
+}
+
+bool AsyncSecureSession::txBusy(void) {
+  return _pcb ? tcp_ssl_tx_busy(_pcb) : false;
+}
+
+void AsyncSecureSession::close(void) {
+  if (_pcb) {
+    tcp_ssl_close(_pcb);
+    tcp_ssl_free(_pcb);
+  }
+  _pcb = NULL;
+  _ssl = NULL;
+  _handshake_done = false;
+}
+
+int AsyncSecureSession::handleRecvError(int read_bytes) {
+  if (read_bytes == BR_ALERT_CLOSE_NOTIFY) {
+    _handshake_done = true;
+    return 0;
+  }
+  return read_bytes;
+}
+
+void AsyncSecureSession::onData(void (*cb)(void* arg, uint8_t* data, size_t len), void* arg) {
+  _on_data_cb = cb; _on_data_arg = arg;
+}
+void AsyncSecureSession::onHandshake(void (*cb)(void* arg), void* arg) {
+  _on_handshake_cb = cb; _on_handshake_arg = arg;
+}
+void AsyncSecureSession::onError(void (*cb)(void* arg, int8_t err), void* arg) {
+  _on_error_cb = cb; _on_error_arg = arg;
+}
+
+void AsyncSecureSession::_s_data(void* arg, struct tcp_pcb* tcp, uint8_t* data, size_t len) {
+  (void)tcp;
+  AsyncSecureSession* s = reinterpret_cast<AsyncSecureSession*>(arg);
+  s->_handshake_done = true;
+  if (s->_on_data_cb) s->_on_data_cb(s->_on_data_arg, data, len);
+}
+
+void AsyncSecureSession::_s_handshake(void* arg, struct tcp_pcb* tcp, SSL* ssl) {
+  (void)tcp; (void)ssl;
+  AsyncSecureSession* s = reinterpret_cast<AsyncSecureSession*>(arg);
+  s->_handshake_done = true;
+  if (s->_on_handshake_cb) s->_on_handshake_cb(s->_on_handshake_arg);
+}
+
+void AsyncSecureSession::_s_ssl_error(void* arg, struct tcp_pcb* tcp, int8_t err) {
+  (void)tcp;
+  AsyncSecureSession* s = reinterpret_cast<AsyncSecureSession*>(arg);
+  if (s->_on_error_cb) s->_on_error_cb(s->_on_error_arg, err);
+}
+#endif  // ASYNC_TCP_SSL_ENABLED
+
 // ===== end BearSSL/ESP8266 =====
 #else
 // ===== begin mbedTLS/ESP32 AsyncSecureSession.cpp (AsyncTCP) =====
@@ -1799,29 +1943,6 @@ typedef struct {
     err_t err;
 } ssl_tcp_api_call_t;
 
-static err_t _tcp_ssl_write_api(struct tcpip_api_call_data *api_call_msg) {
-    ssl_tcp_api_call_t *msg = (ssl_tcp_api_call_t *)api_call_msg;
-    msg->err = tcp_write(msg->pcb, msg->data, msg->size, msg->apiflags);
-    if (msg->err == ERR_OK) {
-        msg->err = tcp_output(msg->pcb);
-    }
-    return msg->err;
-}
-
-static err_t _tcp_ssl_write(tcp_pcb *pcb, const void *data, size_t size, uint8_t apiflags) {
-    if (!pcb) return ERR_CONN;
-    ssl_tcp_api_call_t msg;
-    msg.pcb = pcb;
-    msg.data = data;
-    msg.size = size;
-    msg.apiflags = apiflags;
-    msg.err = ERR_CONN;
-    if (tcpip_api_call(_tcp_ssl_write_api, (struct tcpip_api_call_data *)&msg) != ERR_OK) {
-        return ERR_CONN;
-    }
-    return msg.err;
-}
-
 /* Custom LwIP BIO callbacks for mbedTLS, bridging I/O with raw TCP (tcp_pcb). ctx -> AsyncSecureSession. */
 
 static int _lwip_ssl_send(void *ctx, const unsigned char *buf, size_t len) {
@@ -1829,14 +1950,14 @@ static int _lwip_ssl_send(void *ctx, const unsigned char *buf, size_t len) {
     if (!sslctx || !sslctx->pcb()) {
         return MBEDTLS_ERR_NET_SEND_FAILED;
     }
-    tcp_pcb *pcb = sslctx->pcb();
-
-    err_t err = _tcp_ssl_write(pcb, buf, len, TCP_WRITE_FLAG_COPY);
+    // tcp_core_guard is holder-aware: no re-lock when already on the tcpip
+    // thread, explicit lock when coming from the async task.
+    tcp_core_guard tcg;
+    err_t err = tcp_write(sslctx->pcb(), buf, len, TCP_WRITE_FLAG_COPY);
     if (err == ERR_OK) {
-        return (int)len;
-    }
-    if (err == ERR_MEM) {
-        return MBEDTLS_ERR_SSL_WANT_WRITE;
+        err = tcp_output(sslctx->pcb());
+        if (err == ERR_OK) return (int)len;
+        if (err == ERR_MEM) return MBEDTLS_ERR_SSL_WANT_WRITE;
     }
     return MBEDTLS_ERR_NET_SEND_FAILED;
 }
@@ -1913,6 +2034,17 @@ AsyncSecureSession::AsyncSecureSession(void) {
         async_tcp_log_e("AsyncSecureSession RNG init failed");
     }
     _pcb = NULL;
+    _handshake_done = false;
+    _on_handshake_cb = NULL;
+    _on_handshake_arg = NULL;
+    _deferred_host = NULL;
+    _deferred_root_ca = NULL;
+    _deferred_root_ca_len = 0;
+    _deferred_cli_cert = NULL;
+    _deferred_cli_cert_len = 0;
+    _deferred_cli_key = NULL;
+    _deferred_cli_key_len = 0;
+    _deferred_key_pwd = NULL;
     _ssl_key_password = NULL;
     _have_ca_cert = false;
     _have_client_cert = false;
@@ -1943,12 +2075,32 @@ AsyncSecureSession::~AsyncSecureSession() {
         _ssl_key_password = NULL;
     }
 
+    if (_deferred_host) { free(_deferred_host); _deferred_host = NULL; }
+    if (_deferred_key_pwd) { free(_deferred_key_pwd); _deferred_key_pwd = NULL; }
+
     if (_ssl_rx_buf) {
         free(_ssl_rx_buf);
         _ssl_rx_buf = NULL;
     }
 
     _active_count--;
+}
+
+void AsyncSecureSession::close(void) {
+    _handshake_done = false;
+    // The session owns NO lwIP callbacks — transport teardown (pcb handler
+    // reset + close/abort) is AsyncClient's _tcp_close/_tcp_abort. Just drop
+    // the BIO pointer so late writes/reads fail cleanly.
+    _pcb = NULL;
+}
+
+void AsyncSecureSession::onHandshake(void (*cb)(void *arg), void *arg) {
+    _on_handshake_cb = cb; _on_handshake_arg = arg;
+}
+
+bool AsyncSecureSession::handshakeTimeoutElapsed(void) const {
+    // start==0 means the kick never ran yet — not "started at boot".
+    return handshake_start_time != 0 && (millis() - handshake_start_time) > handshake_timeout;
 }
 
 bool AsyncSecureSession::feedRxData(const unsigned char *data, size_t len) {
@@ -1989,31 +2141,30 @@ bool AsyncSecureSession::feedRxData(const unsigned char *data, size_t len) {
 // and chains any surplus (BIO cap hit) to _pending_pbufs for a later drain.
 // Returns the total count acked so the caller can close the lwIP window.
 // Runs on the lwIP thread or async task (serialized by core lock).
+// Feed ciphertext into the BIO buffer in WIRE ORDER: held pbufs are older,
+// so append the fresh chain after them, then drain from the head. Consumed
+// pbufs are freed; the return value is the consumed byte count (caller acks
+// it via tcp_recved). A surplus (BIO buffer full) stays chained in
+// _pending_pbufs, UNACKED, so lwIP backpressures the peer. Pass pb==NULL to
+// retry draining the held chain. Single-threaded: async task only.
 size_t AsyncSecureSession::feedRx(pbuf *pb) {
   size_t total_recved = 0;
-  pbuf *queue = pb;
-  if (!queue && !_pending_pbufs) {
-    return 0;
-  }
-  while (queue != NULL) {
-    if (!feedRxData((const unsigned char *)queue->payload, queue->len)) {
-      // BIO buffer full — hold remainder without acking (lwIP backpressures)
-      if (_pending_pbufs) {
-        pbuf_chain(_pending_pbufs, queue);
-      } else {
-        _pending_pbufs = queue;
-      }
-      break;
+  if (pb) {
+    if (_pending_pbufs) {
+      pbuf_chain(_pending_pbufs, pb);
+    } else {
+      _pending_pbufs = pb;
     }
-    pbuf *b = queue;
-    queue = b->next;
+  }
+  while (_pending_pbufs) {
+    if (!feedRxData((const unsigned char *)_pending_pbufs->payload, _pending_pbufs->len)) {
+      break;  // BIO buffer full — hold the rest, no ack
+    }
+    pbuf *b = _pending_pbufs;
+    _pending_pbufs = b->next;
     b->next = NULL;
     total_recved += b->len;
     pbuf_free(b);
-    if (!queue && _pending_pbufs) {
-      queue = _pending_pbufs;
-      _pending_pbufs = NULL;
-    }
   }
   return total_recved;
 }
@@ -2058,6 +2209,36 @@ int AsyncSecureSession::startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
         cli_key, cli_key_len,
         NULL, NULL,
         keyPassword);
+}
+
+void AsyncSecureSession::setClientCredentials(const char *host,
+        const unsigned char *rootCA, size_t rootCALen,
+        const unsigned char *cliCert, size_t cliCertLen,
+        const unsigned char *cliKey, size_t cliKeyLen,
+        const char *keyPassword) {
+    if (_deferred_host) { free(_deferred_host); _deferred_host = NULL; }
+    if (_deferred_key_pwd) { free(_deferred_key_pwd); _deferred_key_pwd = NULL; }
+    _deferred_host = host ? strdup(host) : NULL;
+    _deferred_root_ca = rootCA;
+    _deferred_root_ca_len = rootCALen;
+    _deferred_cli_cert = cliCert;
+    _deferred_cli_cert_len = cliCertLen;
+    _deferred_cli_key = cliKey;
+    _deferred_cli_key_len = cliKeyLen;
+    _deferred_key_pwd = keyPassword ? strdup(keyPassword) : NULL;
+}
+
+int AsyncSecureSession::startClient(tcp_pcb *pcb) {
+    if (!pcb) return -1;
+    const char *host = _deferred_host ? _deferred_host : "";
+    if (_deferred_root_ca == NULL) {
+        return startSSLClientInsecure(pcb, host);
+    }
+    return startSSLClient(pcb, host,
+        _deferred_root_ca, _deferred_root_ca_len,
+        _deferred_cli_cert, _deferred_cli_cert_len,
+        _deferred_cli_key, _deferred_cli_key_len,
+        _deferred_key_pwd);
 }
 
 int AsyncSecureSession::_startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
@@ -2209,25 +2390,44 @@ mbedtls_ssl_conf_own_cert(&ssl_conf, &client_cert, &client_key);
     return 0;
 }
 
-int AsyncSecureSession::startSSLServer(tcp_pcb *pcb,
-        const unsigned char *server_cert, size_t server_cert_len,
-        const unsigned char *server_key, size_t server_key_len,
-        const char *password,
-        mbedtls_ssl_cache_context *session_cache) {
+// Parse the server cert/key once per server (idempotent). mbedtls parses PEM
+// natively (MBEDTLS_PEM_PARSE_C) when len covers the trailing NUL — beginSecure
+// passes strlen()+1, and the Firmware's LittleFS copy is NUL-terminated.
+// DER input is parsed by length as-is. Supports PKCS#1/SEC1/PKCS#8 keys,
+// encrypted PKCS#8 via `password`.
+int AsyncSecureServerCtx::ensureParsed(const unsigned char *cbuf, size_t clen,
+        const unsigned char *kbuf, size_t klen, const char *password) {
+    if (parsed) {
+        return 0;
+    }
+    if (!cbuf || !kbuf || !clen || !klen) {
+        return -1;
+    }
+    int ret = mbedtls_x509_crt_parse(&cert, cbuf, clen);
+    if (ret != 0) {
+        async_tcp_log_e("server cert parse failed: -0x%04x", -ret);
+        return ret;
+    }
+    ret = AsyncSecureSession::_parse_private_key(&key, kbuf, klen,
+        (const unsigned char *)password, password ? strlen(password) : 0);
+    if (ret != 0) {
+        async_tcp_log_e("server key parse failed: -0x%04x", -ret);
+        mbedtls_x509_crt_free(&cert);
+        return ret;
+    }
+    parsed = true;
+    return 0;
+}
+
+int AsyncSecureSession::startSSLServer(tcp_pcb *pcb, AsyncSecureServerCtx *srv, const char *password) {
     int ret;
 
     async_tcp_log_d("startSSLServer: free heap %u B", (unsigned)ESP.getFreeHeap());
 
-    if (server_cert == NULL || server_key == NULL || !pcb) {
+    if (!srv || !srv->parsed || !pcb) {
         return -1;
     }
-
-    if (_ssl_key_password) { free((void*)_ssl_key_password); _ssl_key_password = NULL; }
-    _ssl_key_password = password ? strdup(password) : NULL;
-
-    async_tcp_log_v("Seeding the random number generator (server)");
-
-    async_tcp_log_v("Setting up the SSL/TLS structure (server)...");
+    (void)password;  // key already parsed in ensureParsed()
 
     if ((ret = mbedtls_ssl_config_defaults(&ssl_conf,
                                            MBEDTLS_SSL_IS_SERVER,
@@ -2256,113 +2456,19 @@ int AsyncSecureSession::startSSLServer(tcp_pcb *pcb,
     // Self-signed cert — no client certificate verification
     mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
 
-    // Load server certificate
-    mbedtls_x509_crt_init(&client_cert);
+    // Reference the server's pre-parsed cert/key (owned by AsyncSecureServerCtx;
+    // NOT freed by this session).
+    mbedtls_ssl_conf_own_cert(&ssl_conf, &srv->cert, &srv->key);
 
-    if (server_cert_len >= 11 && memcmp(server_cert, "-----BEGIN ", 11) == 0) {
-        // PEM — make a NUL-terminated copy (mbedtls_pem_read_buffer requires it)
-        async_tcp_log_v("Parsing cert PEM (%u bytes)", (unsigned)server_cert_len);
-        char *pem_buf = (char *)malloc(server_cert_len + 1);
-        if (!pem_buf) {
-            _deleteHandshakeCerts();
-            return handle_error(MBEDTLS_ERR_SSL_ALLOC_FAILED);
-        }
-        memcpy(pem_buf, server_cert, server_cert_len);
-        pem_buf[server_cert_len] = '\0';
-        mbedtls_pem_context pem;
-        mbedtls_pem_init(&pem);
-        size_t use_len = 0;
-        size_t cert_der_len = 0;
-        ret = mbedtls_pem_read_buffer(&pem,
-            "-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----",
-            (const unsigned char *)pem_buf, NULL, 0, &use_len);
-        if (ret == 0) {
-            const unsigned char *der_buf = mbedtls_pem_get_buffer(&pem, &cert_der_len);
-            ret = mbedtls_x509_crt_parse(&client_cert, der_buf, cert_der_len);
-        }
-        mbedtls_pem_free(&pem);
-        free(pem_buf);
-    } else {
-        // DER — parse directly with length
-        async_tcp_log_v("Parsing cert DER (%u bytes)", (unsigned)server_cert_len);
-        ret = mbedtls_x509_crt_parse(&client_cert, server_cert, server_cert_len);
-    }
-    _have_client_cert = true;
-    if (ret < 0) {
-        _deleteHandshakeCerts();
-        return handle_error(ret);
-    }
-
-    // Load server private key
-    mbedtls_pk_init(&client_key);
-
-    if (server_key_len >= 11 && memcmp(server_key, "-----BEGIN ", 11) == 0) {
-        // PEM — make a NUL-terminated copy
-        async_tcp_log_v("Parsing key PEM (%u bytes)", (unsigned)server_key_len);
-        char *pem_buf = (char *)malloc(server_key_len + 1);
-        if (!pem_buf) {
-            _deleteHandshakeCerts();
-            return handle_error(MBEDTLS_ERR_SSL_ALLOC_FAILED);
-        }
-        memcpy(pem_buf, server_key, server_key_len);
-        pem_buf[server_key_len] = '\0';
-        mbedtls_pem_context pem;
-        mbedtls_pem_init(&pem);
-        size_t use_len = 0;
-        size_t key_der_len = 0;
-        const unsigned char *pwd = (const unsigned char *)_ssl_key_password;
-        size_t pwd_len = _ssl_key_password ? strlen(_ssl_key_password) : 0;
-
-        static const char *const key_markers[][2] = {
-            { "-----BEGIN EC PRIVATE KEY-----",     "-----END EC PRIVATE KEY-----" },
-            { "-----BEGIN RSA PRIVATE KEY-----",    "-----END RSA PRIVATE KEY-----" },
-            { "-----BEGIN ENCRYPTED PRIVATE KEY-----", "-----END ENCRYPTED PRIVATE KEY-----" },
-            { "-----BEGIN PRIVATE KEY-----",        "-----END PRIVATE KEY-----" },
-        };
-        int pem_found = 0;
-        for (int i = 0; i < 4 && !pem_found; i++) {
-            ret = mbedtls_pem_read_buffer(&pem, key_markers[i][0], key_markers[i][1],
-                (const unsigned char *)pem_buf, pwd, pwd_len, &use_len);
-            if (ret != 0) {
-                continue;
-            }
-            pem_found = 1;
-            const unsigned char *der_buf = mbedtls_pem_get_buffer(&pem, &key_der_len);
-            ret = _parse_private_key(&client_key, der_buf, key_der_len,
-                pwd, pwd_len);
-        }
-        if (!pem_found) {
-            ret = MBEDTLS_ERR_PEM_NO_HEADER_FOOTER_PRESENT;
-        }
-        mbedtls_pem_free(&pem);
-        free(pem_buf);
-    } else {
-        // DER — parse directly with length
-        async_tcp_log_v("Parsing key DER (%u bytes)", (unsigned)server_key_len);
-        ret = _parse_private_key(&client_key, server_key, server_key_len,
-            NULL, 0);
-    }
-    _have_client_key = true;
-    if (ret != 0) {
-        _deleteHandshakeCerts();
-        return handle_error(ret);
-    }
-
-    mbedtls_ssl_conf_own_cert(&ssl_conf, &client_cert, &client_key);
-
-    // Server-side session cache (TLS resumption). Shared across connections
-    // of this server instance; the cache context is owned by the AsyncServer.
-    if (session_cache != NULL) {
-        mbedtls_ssl_conf_session_cache(&ssl_conf, session_cache,
-            mbedtls_ssl_cache_get, mbedtls_ssl_cache_set);
-    }
+    // Server-side session cache (TLS resumption), shared across connections.
+    mbedtls_ssl_conf_session_cache(&ssl_conf, srv->cacheContext(),
+        mbedtls_ssl_cache_get, mbedtls_ssl_cache_set);
 
 #if MBEDTLS_VERSION_MAJOR < 4
     mbedtls_ssl_conf_rng(&ssl_conf, mbedtls_ctr_drbg_random, &drbg_ctx);
 #endif
 
     if ((ret = mbedtls_ssl_setup(&ssl_ctx, &ssl_conf)) != 0) {
-        _deleteHandshakeCerts();
         return handle_error(ret);
     }
 
@@ -2393,9 +2499,9 @@ int AsyncSecureSession::runSSLHandshake(void) {
     async_tcp_log_d("TLS handshake done: %s / %s",
         mbedtls_ssl_get_version(&ssl_ctx), mbedtls_ssl_get_ciphersuite(&ssl_ctx));
 
-    async_tcp_log_v("Verifying peer X.509 certificate...");
-
-    flags = mbedtls_ssl_get_verify_result(&ssl_ctx);
+    // Verify-result is only meaningful with VERIFY_REQUIRED (client w/ CA);
+    // server-side authmode is VERIFY_NONE and would always report SKIP_VERIFY.
+    flags = _have_ca_cert ? mbedtls_ssl_get_verify_result(&ssl_ctx) : 0;
     if (flags != 0) {
         char buf[512];
         memset(buf, 0, sizeof(buf));
@@ -2406,11 +2512,16 @@ int AsyncSecureSession::runSSLHandshake(void) {
             async_tcp_log_e("Failed to verify peer certificate! verification info: %s", buf);
             return handle_error(-1);
         }
-    } else {
+    } else if (_have_ca_cert) {
         async_tcp_log_v("Certificate verified.");
     }
 
     async_tcp_log_v("Free internal heap after TLS %u", ESP.getFreeHeap());
+
+    _handshake_done = true;
+    if (_on_handshake_cb) {
+        _on_handshake_cb(_on_handshake_arg);
+    }
 
     return 0;
 }

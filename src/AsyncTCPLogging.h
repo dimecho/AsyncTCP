@@ -125,3 +125,15 @@
 #endif  // !LIBRETINY && !ARDUINO
 
 #endif  // CONFIG_ASYNC_TCP_LOG_CUSTOM
+
+#include <inttypes.h>  // PRIu32
+
+// Timed-statement log wrapper. EXPANDS at the use site: `statement` runs
+// between two micros() reads, so the enclosing TU must provide micros().
+#define async_tcp_log_elapsed(tag, statement)                          \
+  {                                                                    \
+    [[maybe_unused]]                                                   \
+    const uint32_t s_time = micros();                                  \
+    statement;                                                         \
+    async_tcp_log_v("%s took %" PRIu32 " us", tag, micros() - s_time); \
+  }

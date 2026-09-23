@@ -7,6 +7,8 @@
 // Selected at compile time via #if defined(ESP8266). Only one stack compiles per target.
 #pragma once
 
+class AsyncClient;  // forward decl; AsyncSecureSession.h is included before AsyncClient is defined
+
 // --- TLS configuration ---
 #ifndef ASYNC_TCP_SSL_ENABLED
 #define ASYNC_TCP_SSL_ENABLED 0
@@ -237,7 +239,7 @@ typedef struct {
 } x509_insecure_context;
 #endif
 
-// Callback types for the BearSSL glue layer
+// Callback types for the BearSSL integration layer
 typedef void (*tcp_ssl_data_cb_t)(void* arg, struct tcp_pcb* tcp, uint8_t* data, size_t len);
 typedef void (*tcp_ssl_handshake_cb_t)(void* arg, struct tcp_pcb* tcp, SSL* ssl);
 typedef void (*tcp_ssl_error_cb_t)(void* arg, struct tcp_pcb* tcp, int8_t err);
@@ -375,7 +377,7 @@ bool tcp_ssl_is_stalled(struct tcp_pcb* pcb, uint32_t stall_ms);
 // drive BearSSL. Guards early close from truncating the final response record.
 bool tcp_ssl_tx_busy(struct tcp_pcb* pcb);
 
-// --- Public glue API (client and server) ---
+// --- Public API (client and server) ---
 #if ASYNC_TCP_SSL_ENABLE_SERVER
 BearSSL_SSL_CTX* tcp_ssl_new_server_ctx(const char* cert, const char* private_key_file,
                                 const char* password);
@@ -392,11 +394,8 @@ size_t tcp_ssl_close(struct tcp_pcb* pcb);
 int tcp_ssl_write(struct tcp_pcb* pcb, const uint8_t* data, size_t len);
 int tcp_ssl_read(struct tcp_pcb* pcb, struct pbuf* p);
 
-bool tcp_ssl_has(struct tcp_pcb* pcb);
 #if ASYNC_TCP_SSL_ENABLE_SERVER
-uint8_t tcp_ssl_has_client();
 uint8_t tcp_ssl_client_count();
-uint8_t tcp_ssl_server_handshake_busy();
 uint8_t tcp_ssl_parked_count();
 void tcp_ssl_shed_parked();  // flush the parked queue at the next idle tick
 #endif
@@ -416,10 +415,91 @@ size_t parse_certificates(const char* pem, std::vector<br_x509_certificate>& cer
 // Set up the x509 insecure data structures for BearSSL core to use.
 void br_x509_insecure_init(x509_insecure_context* ctx, bool use_fingerprint, const uint8_t* fingerprint, bool allow_self_signed);
 #endif
+
+#if ASYNC_TCP_SSL_ENABLED
+// ESP8266/BearSSL TLS session. Owns the tcp_ssl_pcb and the lwIP callbacks
+// (data/handshake/err) for a TLS connection. AsyncClient attaches a
+// session on a connected pcb and delegates the data path to it. Mirrors the
+// ESP32 AsyncSecureSession API so AsyncClient code is uniform across platforms.
+class AsyncSecureSession
+{
+public:
+    AsyncSecureSession(void);
+    ~AsyncSecureSession();
+
+    // Start a client TLS session on an already-connected pcb.
+    int startSSLClient(tcp_pcb* pcb, const char* host, BearSSL_SSL_CTX* ssl_ctx = nullptr);
+    // Start a server TLS session on an accepted pcb.
+    int startSSLServer(tcp_pcb* pcb, BearSSL_SSL_CTX* ssl_ctx);
+
+    // Deferred client connect: store host, then start the handshake on the
+    // connected pcb from AsyncClient::_connected (before startSSLClient).
+    void setClientCredentials(const char* host, BearSSL_SSL_CTX* ssl_ctx = nullptr);
+    int startClient(tcp_pcb* pcb);
+
+    // Feed encrypted bytes from the transport; drives decrypt and, once the
+    // handshake is done, delivers plaintext via the registered onData callback.
+    int feedRx(pbuf* pb);
+    // Feed a raw ciphertext buffer (used when the handshake ran from _connected).
+    bool feedRxData(const unsigned char* data, size_t len);
+
+    // Encrypt app data for the transport. Returns bytes accepted.
+    int write(const uint8_t* data, size_t len);
+
+    // Called by AsyncClient::_sent on ciphertext ACK to release outbound slots.
+    void sentAck(size_t acked);
+
+    // No-op for BearSSL (handshake is event-driven); retained for API parity.
+    int runSSLHandshake(void) { return handshakeDone() ? 0 : -1; }
+    // Force-engine pump (used from AsyncClient::_poll when the schedule pool
+    // was full). Returns 0 when the handshake has completed.
+    int pump(void);
+
+    bool handshakeDone(void) const { return _handshake_done; }
+    tcp_pcb* pcb(void) const { return _pcb; }
+
+    // True once a conn has been in a hard SENDREC stall longer than stall_ms.
+    bool isStalled(uint32_t stall_ms);
+    // True while the engine still holds a TLS record not yet in TCP.
+    bool txBusy(void);
+
+    // Release TLS state and close the underlying transport.
+    void close(void);
+
+    // Deliver a peer close_notify/alert.
+    int handleRecvError(int read_bytes);
+
+    // --- application callbacks (set by the owning AsyncClient) ---
+    void onData(void (*cb)(void* arg, uint8_t* data, size_t len), void* arg);
+    void onHandshake(void (*cb)(void* arg), void* arg);
+    void onError(void (*cb)(void* arg, int8_t err), void* arg);
+
+private:
+    static void _s_data(void* arg, struct tcp_pcb* tcp, uint8_t* data, size_t len);
+    static void _s_handshake(void* arg, struct tcp_pcb* tcp, SSL* ssl);
+    static void _s_ssl_error(void* arg, struct tcp_pcb* tcp, int8_t err);
+
+    tcp_pcb* _pcb;
+    tcp_ssl_pcb* _ssl;
+    bool _handshake_done;
+    char* _deferred_host;
+    BearSSL_SSL_CTX* _deferred_ssl_ctx;
+
+    void (*_on_data_cb)(void* arg, uint8_t* data, size_t len);
+    void* _on_data_arg;
+    void (*_on_handshake_cb)(void* arg);
+    void* _on_handshake_arg;
+    void (*_on_error_cb)(void* arg, int8_t err);
+    void* _on_error_arg;
+};
+#endif
+
 // ===== end BearSSL/ESP8266 =====
 #else
 // ===== begin mbedTLS/ESP32 AsyncSecureSession.h (AsyncTCP) =====
 #pragma once
+
+#include "lwip/err.h"  // err_t for the session's private lwIP callback declarations
 
 #if ASYNC_TCP_SSL_ENABLED
 
@@ -453,6 +533,7 @@ void br_x509_insecure_init(x509_insecure_context* ctx, bool use_fingerprint, con
 
 struct tcp_pcb;
 struct pbuf;
+class AsyncSecureServerCtx;  // server admission state (defined below)
 
 #define ASYNCTCP_TLS_CAN_RETRY(r)   (((r) == MBEDTLS_ERR_SSL_WANT_READ) || ((r) == MBEDTLS_ERR_SSL_WANT_WRITE))
 #define ASYNCTCP_TLS_EOF(r)         (((r) == MBEDTLS_ERR_SSL_CONN_EOF) || ((r) == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY))
@@ -480,10 +561,14 @@ private:
 #if MBEDTLS_VERSION_MAJOR < 4
     static void _rng_seed_and_set(void);
 #endif
+public:
     // Parse a PEM/DER private key. v3 supplies the legacy RNG; v4 uses PSA.
+    // Public: shared with AsyncSecureServerCtx::ensureParsed (server cert/key
+    // parsed once per server, referenced by every connection).
     static int _parse_private_key(mbedtls_pk_context *pk,
         const unsigned char *key, size_t keylen,
         const unsigned char *pwd, size_t pwdlen);
+private:
 
     // Concurrent connection tracking
     static int _active_count;
@@ -499,6 +584,19 @@ private:
     unsigned long handshake_start_time;
 
     tcp_pcb *_pcb;
+    bool _handshake_done;
+    void (*_on_handshake_cb)(void *arg);
+    void *_on_handshake_arg;
+
+    // Deferred client credentials (setClientCredentials before connect)
+    char *_deferred_host;
+    const unsigned char *_deferred_root_ca;
+    size_t _deferred_root_ca_len;
+    const unsigned char *_deferred_cli_cert;
+    size_t _deferred_cli_cert_len;
+    const unsigned char *_deferred_cli_key;
+    size_t _deferred_cli_key_len;
+    char *_deferred_key_pwd;
 
     // PEM password for encrypted private keys (owned copy via strdup)
     char *_ssl_key_password;
@@ -529,10 +627,26 @@ public:
     // Feed encrypted data from TCP into BIO buffer (returns false if buffer full)
     bool feedRxData(const unsigned char *data, size_t len);
     size_t feedRx(pbuf *pb);
-    size_t rxBufLen() const { return _ssl_rx_buf_len - _ssl_rx_pos; }
 
     // Check if BIO has buffered rx data available
     bool hasRxData(void) const { return _ssl_rx_buf && (_ssl_rx_pos < _ssl_rx_buf_len); }
+
+    // True once the TLS handshake has completed. The session owns handshake
+    // state (AsyncClient no longer tracks it).
+    bool handshakeDone(void) const { return _handshake_done; }
+
+    // Release TLS state and close the underlying transport. Called by
+    // AsyncClient::_close()/abort() while the pcb is still live.
+    void close(void);
+
+    // The session owns NO lwIP callbacks: ciphertext arrives via the owning
+    // AsyncClient's normal event dispatch, and all TLS work happens on the
+    // async task (SecureClientHooks). Only the handshake-complete app
+    // notification is registered here.
+    void onHandshake(void (*cb)(void *arg), void *arg);
+
+    // True when the handshake exceeded the timeout (used by hooks onPoll).
+    bool handshakeTimeoutElapsed(void) const;
 
     // Public accessor for PCB (needed by BIO callbacks)
     tcp_pcb *pcb() const { return _pcb; }
@@ -543,6 +657,17 @@ public:
     static int getActiveCount() { return _active_count; }
 
     int startSSLClientInsecure(tcp_pcb *pcb, const char *host_or_ip);
+
+    // Store client credentials for a deferred connect (attached before
+    // AsyncClient::connect()). AsyncClient starts the handshake automatically
+    // on TCP connect via startClient().
+    void setClientCredentials(const char *host,
+        const unsigned char *rootCA, size_t rootCALen,
+        const unsigned char *cliCert, size_t cliCertLen,
+        const unsigned char *cliKey, size_t cliKeyLen,
+        const char *keyPassword = NULL);
+    // Start the client handshake on a now-connected pcb using stored creds.
+    int startClient(tcp_pcb *pcb);
 
 #if defined(MBEDTLS_KEY_EXCHANGE__SOME__PSK_ENABLED) || defined(MBEDTLS_KEY_EXCHANGE_SOME_PSK_ENABLED)
     int startSSLClient(tcp_pcb *pcb, const char *host_or_ip,
@@ -561,11 +686,9 @@ public:
         const unsigned char *cli_key, const size_t cli_key_len,
         const char *keyPassword = NULL);
 
-    int startSSLServer(tcp_pcb *pcb,
-        const unsigned char *server_cert, size_t server_cert_len,
-        const unsigned char *server_key, size_t server_key_len,
-        const char *password = NULL,
-        mbedtls_ssl_cache_context *session_cache = NULL);
+    // Server handshake on an accepted pcb; uses the server's pre-parsed
+    // cert/key and shared session cache (see AsyncSecureServerCtx).
+    int startSSLServer(tcp_pcb *pcb, AsyncSecureServerCtx *srv, const char *password = NULL);
 
     int runSSLHandshake(void);
 
@@ -578,8 +701,9 @@ public:
     int sslRead(uint8_t *data, size_t len);
 };
 
-// Server-side TLS admission state: session cache + bounded park queue. Lives
-// one-per-AsyncServer (value member); only present when the server is secure.
+// Server-side TLS admission state: session cache + bounded park queue +
+// the PRE-PARSED server cert/key. Lives one-per-AsyncServer (value member);
+// only present when the server is secure.
 class AsyncSecureServerCtx
 {
 public:
@@ -588,18 +712,56 @@ public:
         mbedtls_ssl_cache_init(&cache);
         mbedtls_ssl_cache_set_max_entries(&cache, SSL_SESSION_CACHE);
         mbedtls_ssl_cache_set_timeout(&cache, 0);
+        mbedtls_x509_crt_init(&cert);
+        mbedtls_pk_init(&key);
+        pending = nullptr;
+        parked = 0;
     }
-    ~AsyncSecureServerCtx() { mbedtls_ssl_cache_free(&cache); }
+    ~AsyncSecureServerCtx() {
+        mbedtls_ssl_cache_free(&cache);
+        mbedtls_x509_crt_free(&cert);
+        mbedtls_pk_free(&key);
+    }
     mbedtls_ssl_cache_context *cacheContext() { return &cache; }
     int liveServeCount() const { return AsyncSecureSession::getActiveCount(); }
     AsyncSecureServerCtx(const AsyncSecureServerCtx &) = delete;
     AsyncSecureServerCtx &operator=(const AsyncSecureServerCtx &) = delete;
 
+    // Parse the server cert/key ONCE (idempotent). Per-conn starts reference
+    // these parsed objects instead of re-parsing PEM on every handshake.
+    int ensureParsed(const unsigned char *cert, size_t cert_len,
+        const unsigned char *key, size_t key_len, const char *password);
+
     mbedtls_ssl_cache_context cache;
+    mbedtls_x509_crt cert;
+    mbedtls_pk_context key;
+    bool parsed = false;
     struct pending_pcb *pending;
     volatile int parked;
 };
 
 #endif // ASYNC_TCP_SSL_ENABLED
+
 // ===== end mbedTLS/ESP32 AsyncSecureSession.h =====
 #endif
+
+// TLS client lifecycle hooks: adapter over AsyncSecureSession, attached via
+// AsyncClient::setHooks(). Declared here (shared by AsyncSecureClient.cpp and
+// AsyncSecureServer.cpp); the method bodies live in AsyncSecureClient.cpp.
+#if ASYNC_TCP_SSL_ENABLED
+struct SecureClientHooks : AsyncClientHooks {
+  SecureClientHooks(AsyncSecureSession *s, AsyncClient *c);
+  ~SecureClientHooks() override { delete sess; }
+
+  bool onConnected(AsyncClient *c) override;
+  bool onRecv(AsyncClient *c, struct pbuf *pb) override;
+  bool onSent(AsyncClient *c, uint16_t len) override;
+  bool onPoll(AsyncClient *c) override;
+  int onWrite(AsyncClient *c, const char *data, size_t size) override;
+  void onClosing(AsyncClient *c) override;
+  void onError(AsyncClient *c, int8_t err) override;
+
+  AsyncSecureSession *sess;
+  AsyncClient *client;
+};
+#endif // ASYNC_TCP_SSL_ENABLED

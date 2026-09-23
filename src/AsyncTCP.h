@@ -6,15 +6,12 @@
 //   - ESP32/LIBRETINY -> mbedTLS stack (AsyncTCP ESP32Async base)
 // Selected at compile time via #if defined(ESP8266). Only one stack compiles per target.
 
-// SPDX-License-Identifier: LGPL-3.0-or-later
-// Copyright 2016-2026 Hristo Gochkov, Mathieu Carbou, Emil Muratov, Will Miles
-
 #ifndef ASYNCTCP_H_
 #define ASYNCTCP_H_
 
 #include "AsyncTCPVersion.h"
-#include "AsyncSecureSession.h"  // SSL/TLS
-#define ASYNCTCP_FORK_ESP32Async
+#include <stdint.h>
+#include <stddef.h>
 
 #ifdef ARDUINO
 #include "IPAddress.h"
@@ -27,8 +24,10 @@
 #include "lwip/ip_addr.h"
 #include <functional>
 
-#if defined(ESP8266)
+#if defined(ESP32)
+#include "sdkconfig.h"
 extern "C" {
+#include "freertos/semphr.h"
 #include "lwip/pbuf.h"
 }
 #elif defined(LIBRETINY)
@@ -37,14 +36,11 @@ extern "C" {
 #include <FreeRTOS.h>
 #include <semphr.h>
 }
-#else /* ESP32 */
-#include "sdkconfig.h"
+#elif defined(ESP8266)
 extern "C" {
-#include "freertos/semphr.h"
 #include "lwip/pbuf.h"
 }
 #endif
-
 
 // If core is not defined, then we are running in Arduino or PIO
 #ifndef CONFIG_ASYNC_TCP_RUNNING_CORE
@@ -86,10 +82,77 @@ typedef std::function<void(void *, AsyncClient *, uint32_t time)> AcTimeoutHandl
 
 struct tcp_pcb;
 class AsyncTCP_detail;
+
+struct pbuf;
+
+// Optional client TLS hooks. TLS attaches to take over the data path;
+struct AsyncClientHooks {
+  virtual ~AsyncClientHooks() {}
+  // TCP established; return true to skip the default onConnect flow
+  // (e.g. onConnect fires later, on handshake completion).
+  virtual bool onConnected(AsyncClient *c) { (void)c; return false; }
+  // inbound data; return true if consumed (skips the plain path)
+  virtual bool onRecv(AsyncClient *c, struct pbuf *pb) { (void)c; (void)pb; return false; }
+  // outbound ACK; return true to skip app-level accounting (mid-handshake)
+  virtual bool onSent(AsyncClient *c, uint16_t len) { (void)c; (void)len; return false; }
+  // periodic tick; return true if the hook closed the connection
+  virtual bool onPoll(AsyncClient *c) { (void)c; return false; }
+  // TX path; return >= 0 = consumed (value = bytes accepted), -1 = plain path
+  virtual int onWrite(AsyncClient *c, const char *data, size_t size) { (void)c; (void)data; (void)size; return -1; }
+  // _close()/abort(): teardown while the pcb is still live
+  virtual void onClosing(AsyncClient *c) { (void)c; }
+  // transport RST/error: the pcb is already gone
+  virtual void onError(AsyncClient *c, int8_t err) { (void)c; (void)err; }
+
+protected:
+  // Helpers for hook implementations: AsyncClientHooks is part of
+  // AsyncClient, not inherited, so implementations reach
+  // client internals through these. Defined in AsyncTCP.cpp.
+  void touchRx(AsyncClient *c, uint32_t now);
+  uint32_t lastRx(AsyncClient *c) const;
+  void notifyData(AsyncClient *c, void *data, size_t len);
+  void notifyConnect(AsyncClient *c);
+  void notifyError(AsyncClient *c, int8_t err);
+  void notifyDiscard(AsyncClient *c);
+  void recved(AsyncClient *c, size_t len);  // ack consumed ciphertext to the lwIP window
+};
+
+class AsyncServer;
+
+// Optional server TLS hooks. TLS attaches to take over handshake and the data path;
+struct AsyncServerHooks {
+  virtual ~AsyncServerHooks() {}
+  // Admission (LwIP thread). Return an lwIP ERR_* code if the hook handled
+  // the pcb (served or parked), -1 to fall through to the plain accept path.
+  virtual int8_t onAccept(AsyncServer *srv, tcp_pcb *pcb, int8_t err) { (void)srv; (void)pcb; (void)err; return -1; }
+  // Accepted client (async task). Return an lwIP ERR_* code if the hook
+  // handled the client, -1 to fall through to the plain onClient callback.
+  virtual int8_t onAccepted(AsyncServer *srv, AsyncClient *client) { (void)srv; (void)client; return -1; }
+  // A live connection tore down (its TLS buffers already freed) — the hook
+  // may promote queued connections immediately.
+  virtual void onConnDone(AsyncServer *srv, AsyncClient *client) { (void)srv; (void)client; }
+
+protected:
+  // Helpers for hook implementations: reach AsyncServer/AsyncClient internals
+  // (AsyncServerHooks is a friend of both, but friendship is not inherited).
+  // Defined in AsyncTCP.cpp.
+  void notifyClient(AsyncServer *srv, AsyncClient *c);                     // fire the app's onClient
+  bool hasConnectHandler(AsyncServer *srv);                                 // is the app's onClient callback set?
+  void doPromote(AsyncClient *c, void (*thunk)(void *, AsyncClient *), void *arg);  // set the client's instant-promote hook
+  struct pbuf *takeStaged(AsyncClient *c);                                  // pop the staged park-queue pbufs
+  void stageStaged(AsyncClient *c, struct pbuf *staged);                   // stash staged park-queue pbufs on the client
+  void feedPbuf(AsyncClient *c, struct pbuf *pb);                          // feed a pbuf into the client's recv path
+  void detachPcb(AsyncClient *c);                                            // null the client's pcb (pre-abort detach)
+  bool queueAccept(AsyncServer *srv, AsyncClient *c);                    // queue the accept event for a created client
+};
+
+#include "AsyncSecureSession.h"
+
 struct AsyncClientCallbackContext;
 struct pending_pcb;
 
-#if defined(ESP8266)   // ---------------- ESP8266 + BearSSL -------------
+#if defined(ESP8266)
+// ---------------- ESP8266 + BearSSL -------------
 #if ASYNC_TCP_SSL_ENABLED
 typedef std::function<int(void *arg, const char *filename, uint8_t **buf)> AcSSLFileHandler;
 typedef AcSSLFileHandler AcSSlFileHandler;  // backward compat (old typo)
@@ -99,9 +162,6 @@ struct pending_pcb;
 class AsyncClient {
 public:
   AsyncClient(tcp_pcb *pcb = 0);
-#if ASYNC_TCP_SSL_ENABLED
-  AsyncClient(tcp_pcb *pcb, BearSSL_SSL_CTX *ssl_ctx);
-#endif
   ~AsyncClient();
 
   // Noncopyable
@@ -125,17 +185,6 @@ public:
 #endif
 #endif
   bool connect(const char *host, uint16_t port);
-
-#if ASYNC_TCP_SSL_ENABLED
-  void setSSLContext(BearSSL_SSL_CTX *ctx) {
-    _client_ssl_ctx = ctx;
-  }
-  BearSSL_SSL_CTX *getSSLContext() const {
-    return _client_ssl_ctx;
-  }
-  bool startTLS(const char *host = "");
-  bool beginSecure(const char *host, uint16_t port, const char *rootCA = NULL);
-#endif
 
   /**
      * @brief close connection
@@ -284,14 +333,21 @@ public:
   static const char *errorToString(int8_t error);
   const char *stateToString() const;
 
-  int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
+  int8_t _recv(tcp_pcb *pcb, pbuf *pb, err_t err);
   tcp_pcb *pcb() {
     return _pcb;
   }
 
+  // Attach optional lifecycle hooks (TLS, or any other protocol layer).
+  // See AsyncClientHooks.
+  void setHooks(AsyncClientHooks *hooks);
+
 protected:
   friend class AsyncTCP_detail;
   friend class AsyncServer;
+  friend class AsyncSecureServer;
+  friend class AsyncClientHooks;
+  friend class AsyncServerHooks;
 
   tcp_pcb *_pcb;
 
@@ -314,50 +370,38 @@ protected:
   AcConnectHandler _poll_cb;
   void *_poll_cb_arg;
   
-#if ASYNC_TCP_SSL_ENABLED
-  bool _pcb_secure;
-  bool _handshake_done;
-  BearSSL_SSL_CTX *_client_ssl_ctx;
-#endif
-
   AsyncClientCallbackContext *_cb_ctx;
   uint32_t _tx_last_packet;
-  uint32_t _tx_unacked_len;
   uint32_t _rx_ack_len;
   uint32_t _rx_last_packet;
   uint32_t _rx_timeout;
   uint32_t _rx_last_ack;
   uint32_t _ack_timeout;
   uint16_t _connect_port;
+  AsyncClientHooks *_tls_client_hooks;
+#if ASYNC_TCP_SSL_ENABLED
+  pbuf *_ssl_pending_pbufs;  // staged park-queue pbufs, fed to the session on accept
+  // (internal) Thread-safe deferred ACK (tcpip_api_call). Defined in AsyncTCP.cpp.
+  static void _tcp_recved(tcp_pcb **pcbp, size_t len);
+#endif
 
   int8_t _close();
   int8_t _connected(tcp_pcb *pcb, int8_t err);
-  // TLS-aware connect. Public connect() is always plain TCP; beginSecure() is
-  // the TLS entry point. The secure flag selects the transport and is mirrored
-  // by _pcb_secure/_handshake_done.
-  bool connect(ip_addr_t addr, uint16_t port, bool secure);
-#ifdef ARDUINO
-  bool connect(const IPAddress &ip, uint16_t port, bool secure);
-#if __has_include(<IPv6Address.h>)
-  bool connect(const IPv6Address &ip, uint16_t port, bool secure);
-#endif
-#endif
-  bool connect(const char *host, uint16_t port, bool secure);
   void _error(int8_t err);
-#if ASYNC_TCP_SSL_ENABLED
-  void _ssl_error(int8_t err);
-#endif
   int8_t _poll(tcp_pcb *pcb);
   int8_t _sent(tcp_pcb *pcb, uint16_t len);
-  int8_t _fin(tcp_pcb *pcb, int8_t err);
+  int8_t _fin(tcp_pcb *pcb, err_t err);
   void _dns_found(ip_addr_t *ipaddr);
-
-#if ASYNC_TCP_SSL_ENABLED
-  static void _s_data(void *arg, struct tcp_pcb *tcp, uint8_t *data, size_t len);
-  static void _s_handshake(void *arg, struct tcp_pcb *tcp, SSL *ssl);
-  static void _s_ssl_error(void *arg, struct tcp_pcb *tcp, int8_t err);
-#endif
 };
+
+// TLS client: inherits AsyncClient (pure-TCP transport + the setHooks() seam)
+// and adds the beginSecure() convenience. Defined in AsyncSecureClient.cpp.
+#if ASYNC_TCP_SSL_ENABLED
+class AsyncSecureClient : public AsyncClient {
+public:
+  bool beginSecure(const char *host, uint16_t port, const char *rootCA = NULL);
+};
+#endif
 
 class AsyncServer {
 public:
@@ -371,8 +415,11 @@ public:
   AsyncServer(uint16_t port);
   ~AsyncServer();
   void onClient(AcConnectHandler cb, void *arg);
+  void setHooks(AsyncServerHooks *hooks);
 #if ASYNC_TCP_SSL_ENABLED
-  void onSslFileRequest(AcSSLFileHandler cb, void *arg);
+  // Backward-compat TLS entry points: configure + install the TLS server
+  // hooks on this plain server. Implementations in AsyncSecureServer.cpp.
+  void onSslFileRequest(AcSSlFileHandler cb, void *arg);
   void beginSecure(const char *cert, const char *private_key_file, const char *password);
 #endif
   void begin();
@@ -381,8 +428,16 @@ public:
   bool getNoDelay() const;
   uint8_t status() const;
 
+public:
+  // (internal) Queue the LWIP_TCP_ACCEPT event for a freshly accepted client.
+  // Defined in AsyncTCP.cpp, which owns the event queue.
+  static bool queueAcceptEvent(AsyncClient *client, void *server);
+
 protected:
   friend class AsyncTCP_detail;
+  friend class AsyncServerHooks;
+
+  AsyncServerHooks *_tls_server_hooks;
 
   uint16_t _port;
   ip_addr_t _addr;
@@ -390,36 +445,49 @@ protected:
   tcp_pcb *_pcb;
   AcConnectHandler _connect_cb;
   void *_connect_cb_arg;
-#if ASYNC_TCP_SSL_ENABLED
-  struct pending_pcb *_pending;  // parked queue (FIFO, p->pb buffered)
-  BearSSL_SSL_CTX *_ssl_ctx;
-  AcSSLFileHandler _file_cb;
-  void *_file_cb_arg;
-#endif
 
+  // Accept a connection and create its AsyncClient. Pure TCP; server hooks
+  // may take over admission (park/serve queue).
   int8_t _accept(tcp_pcb *newpcb, int8_t err);
   int8_t _accepted(AsyncClient *client);
-
-#if ASYNC_TCP_SSL_ENABLED
-  AsyncClient *_serveTls(tcp_pcb *pcb);
-  int _cert(const char *filename, uint8_t **buf);
-  int8_t _poll(tcp_pcb *pcb);
-  int8_t _recv(tcp_pcb *pcb, struct pbuf *pb, int8_t err);
-  void _error(int8_t err);
-  int8_t _promoteSlot(void);
-  void _conn_done(AsyncClient *client);
-  static int _s_cert(void *arg, const char *filename, uint8_t **buf);
-  static err_t _s_poll(void *arg, struct tcp_pcb *tpcb);
-  static err_t _s_recv(void *arg, struct tcp_pcb *tpcb, struct pbuf *pb, err_t err);
-  static void _s_error(void *arg, err_t err);
-  static void _s_conn_done(void *arg, AsyncClient *client);
-#endif
 };
-#else                 // ---------------- ESP32/LIBRETINY + mbedTLS ------
+
+// TLS server: thin composition wrapper around AsyncServer. Installs the TLS
+// server hooks (admission/serve/promotion) on the composed transport;
+// implementations live in AsyncSecureServer.cpp.
+#if ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_SERVER
+class AsyncSecureServer {
+public:
+  AsyncSecureServer(ip_addr_t addr, uint16_t port);
+#ifdef ARDUINO
+  AsyncSecureServer(IPAddress addr, uint16_t port);
+#if __has_include(<IPv6Address.h>)
+  AsyncSecureServer(IPv6Address addr, uint16_t port);
+#endif
+#endif
+  AsyncSecureServer(uint16_t port);
+~AsyncSecureServer();
+
+  void onClient(AcConnectHandler cb, void *arg);
+  void setHooks(AsyncServerHooks *hooks);
+  void begin();
+  void end();
+  void setNoDelay(bool nodelay);
+  bool getNoDelay() const;
+  uint8_t status() const;
+
+  void onSslFileRequest(AcSSLFileHandler cb, void *arg);
+  void beginSecure(const char *cert, const char *private_key_file, const char *password);
+
+private:
+  AsyncServer _tcp;  // pure-TCP server
+};
+#endif
+#else /* ESP32 */
+// ---------------- ESP32/LIBRETINY + mbedTLS ------
 #if ASYNC_TCP_SSL_ENABLED
 typedef std::function<int(void *arg, uint8_t **cert, uint8_t **key)> AcSSlFileHandler;
 #endif
-
 class AsyncClient {
 public:
   AsyncClient(tcp_pcb *pcb = 0);
@@ -608,36 +676,23 @@ public:
   static const char *errorToString(int8_t error);
   const char *stateToString() const;
 
-  int8_t _recv(tcp_pcb *pcb, pbuf *pb, int8_t err);
+  int8_t _recv(tcp_pcb *pcb, pbuf *pb, err_t err);
   tcp_pcb *pcb() {
     return _pcb;
   }
 
 #if ASYNC_TCP_SSL_ENABLED
-  // SSL support (mbedTLS stack)
-  bool beginSecure(const char *host, uint16_t port, const char *rootCA,
-      const char *clientCert = NULL, const char *clientKey = NULL,
-      const char *keyPassword = NULL);
-  bool beginSecure(const char *host, uint16_t port,
-      const unsigned char *rootCA, size_t rootCALen,
-      const unsigned char *clientCert = NULL, size_t clientCertLen = 0,
-      const unsigned char *clientKey = NULL, size_t clientKeyLen = 0,
-      const char *keyPassword = NULL);
-  bool startTLS(const char *host = "");
-  bool ssl() const { return _secure != nullptr; }
-  void setSSLReceiveTimeout(uint32_t timeout) { _ssl_timeout = timeout; }
-  uint32_t getSSLReceiveTimeout() const { return _ssl_timeout; }
-  AsyncSecureSession *getSSLContext() { return _secure; }
-  void feedSSLRxData(const unsigned char *data, size_t len);
-  bool hasSSLRxData() const;
-  int sslRead(uint8_t *data, size_t len);
-  int sslWrite(const uint8_t *data, size_t len);
-  int runSSLHandshake();
+  // Attach optional lifecycle hooks (TLS, or any other protocol layer).
+  // See AsyncClientHooks.
+  void setHooks(AsyncClientHooks *hooks);
 #endif
 
 protected:
   friend class AsyncTCP_detail;
   friend class AsyncServer;
+  friend class AsyncSecureServer;
+  friend class AsyncClientHooks;
+  friend class AsyncServerHooks;
 
   tcp_pcb *_pcb;
 
@@ -666,32 +721,39 @@ protected:
   uint32_t _rx_last_ack;
   uint32_t _ack_timeout;
   uint16_t _connect_port;
+  AsyncClientHooks *_tls_client_hooks;
+  AcConnectHandler _server_discard_cb;  // set by AsyncServer for instant slot promote
+  void *_server_discard_cb_arg;
+#if ASYNC_TCP_SSL_ENABLED
+  pbuf *_ssl_pending_pbufs;  // staged park-queue pbufs, fed to the session on accept
+  // (internal) Thread-safe deferred ACK (tcpip_api_call). Defined in AsyncTCP.cpp.
+  static void _tcp_recved(tcp_pcb **pcbp, size_t len);
+#endif
 
   int8_t _close();
   int8_t _connected(tcp_pcb *pcb, int8_t err);
   void _error(int8_t err);
   int8_t _poll(tcp_pcb *pcb);
   int8_t _sent(tcp_pcb *pcb, uint16_t len);
-  int8_t _fin(tcp_pcb *pcb, int8_t err);
+  int8_t _fin(tcp_pcb *pcb, err_t err);
   void _dns_found(ip_addr_t *ipaddr);
-#if ASYNC_TCP_SSL_ENABLED
-  AsyncSecureSession *_secure;       // replaces pre-refactor _ssl_ctx
-  uint32_t _ssl_timeout;
-  bool _ssl_handshake_done;
-  String _ssl_host;                  // kept: SNI + "beginSecure requested" carrier
-  const unsigned char *_ssl_ca_cert;
-  size_t _ssl_ca_cert_len;
-  const unsigned char *_ssl_client_cert;
-  size_t _ssl_client_cert_len;
-  const unsigned char *_ssl_client_key;
-  size_t _ssl_client_key_len;
-  char *_ssl_key_password;
-  void _clearSSLParams(void);
-  pbuf *_staged_pbufs;               // was _ssl_pending_pbufs; transient only
-  AcConnectHandler _server_discard_cb;
-  void *_server_discard_cb_arg;
-#endif
 };
+
+// TLS client: inherits AsyncClient (pure-TCP transport + the setHooks() seam)
+// and adds the beginSecure() convenience. Defined in AsyncSecureClient.cpp.
+#if ASYNC_TCP_SSL_ENABLED
+class AsyncSecureClient : public AsyncClient {
+public:
+  bool beginSecure(const char *host, uint16_t port, const char *rootCA = NULL,
+      const char *clientCert = NULL, const char *clientKey = NULL,
+      const char *keyPassword = NULL);
+  bool beginSecure(const char *host, uint16_t port,
+      const unsigned char *rootCA, size_t rootCALen,
+      const unsigned char *clientCert = NULL, size_t clientCertLen = 0,
+      const unsigned char *clientKey = NULL, size_t clientKeyLen = 0,
+      const char *keyPassword = NULL);
+};
+#endif
 
 class AsyncServer {
 public:
@@ -705,27 +767,29 @@ public:
   AsyncServer(uint16_t port);
   ~AsyncServer();
   void onClient(AcConnectHandler cb, void *arg);
+  void setHooks(AsyncServerHooks *hooks);
+#if ASYNC_TCP_SSL_ENABLED
+  // Backward-compat TLS entry points: configure + install the TLS server
+  // hooks on this plain server. Implementations in AsyncSecureServer.cpp.
+  void onSslFileRequest(AcSSlFileHandler cb, void *arg);
+  void beginSecure(const char *cert, const char *private_key_file, const char *password);
+#endif
   void begin();
   void end();
   void setNoDelay(bool nodelay);
   bool getNoDelay() const;
   uint8_t status() const;
 
-#if ASYNC_TCP_SSL_ENABLED
-  // SSL server support (mbedTLS stack)
-  bool beginSecure(const unsigned char *cert, size_t certLen,
-      const unsigned char *key, size_t keyLen);
-  bool beginSecure(const char *certPEM, const char *keyPEM);
-  bool beginSecure(const char *certPEM, const char *keyPEM, const char *password);
-  void setDefaultCertificate(const unsigned char *cert, size_t certLen);
-  void setDefaultKey(const unsigned char *key, size_t keyLen);
-  void setDefaultCertificatePEM(const char *certPEM);
-  void setDefaultKeyPEM(const char *keyPEM);
-  void onSslFileRequest(AcSSlFileHandler cb, void *arg);
-#endif
+public:
+  // (internal) Queue the LWIP_TCP_ACCEPT event for a freshly accepted client.
+  // Defined in AsyncTCP.cpp, which owns the event queue.
+  static bool queueAcceptEvent(AsyncClient *client, void *server);
 
 protected:
   friend class AsyncTCP_detail;
+  friend class AsyncServerHooks;
+
+  AsyncServerHooks *_tls_server_hooks;
 
   uint16_t _port;
   ip_addr_t _addr;
@@ -734,33 +798,43 @@ protected:
   AcConnectHandler _connect_cb;
   void *_connect_cb_arg;
 
-#if ASYNC_TCP_SSL_ENABLED
-  bool _use_ssl;
-  const unsigned char *_cert;
-  size_t _cert_len;
-  const unsigned char *_key;
-  size_t _key_len;
-  AcSSlFileHandler _ssl_file_cb;
-  void *_ssl_file_cb_arg;
-  const char *_ssl_key_password;
-
-  // Server-side TLS admission: session cache + bounded park queue.
-  AsyncSecureServerCtx _secureCtx;
-#endif
-
+  // Accept a connection and create its AsyncClient. Pure TCP; server hooks
+  // may take over admission (park/serve queue).
   int8_t _accept(tcp_pcb *newpcb, int8_t err);
   int8_t _accepted(AsyncClient *client);
-  int8_t _serverAccept(tcp_pcb *pcb, struct pbuf *staged);
-  int8_t _s_poll(tcp_pcb *pcb);
-  int8_t _s_recv(tcp_pcb *pcb, struct pbuf *pb, int8_t err);
-  void _s_error(int8_t err);
-  int8_t _promoteSlot(void);
-  void _conn_done(AsyncClient *client);
-  static err_t _s_poll_cb(void *arg, tcp_pcb *tpcb);
-  static err_t _s_recv_cb(void *arg, tcp_pcb *tpcb, struct pbuf *pb, err_t err);
-  static void _s_error_cb(void *arg, err_t err);
-  static void _s_conn_done_cb(void *arg, AsyncClient *client);
 };
+
+// TLS server: thin composition wrapper around AsyncServer. Installs the TLS
+// server hooks (admission/serve/promotion) on the composed transport;
+// implementations live in AsyncSecureServer.cpp.
+#if ASYNC_TCP_SSL_ENABLED
+class AsyncSecureServer {
+public:
+  AsyncSecureServer(ip_addr_t addr, uint16_t port);
+#ifdef ARDUINO
+  AsyncSecureServer(IPAddress addr, uint16_t port);
+#if __has_include(<IPv6Address.h>)
+  AsyncSecureServer(IPv6Address addr, uint16_t port);
+#endif
+#endif
+  AsyncSecureServer(uint16_t port);
+~AsyncSecureServer();
+
+  void onClient(AcConnectHandler cb, void *arg);
+  void setHooks(AsyncServerHooks *hooks);
+  void begin();
+  void end();
+  void setNoDelay(bool nodelay);
+  bool getNoDelay() const;
+  uint8_t status() const;
+
+  void onSslFileRequest(AcSSlFileHandler cb, void *arg);
+  void beginSecure(const char *cert, const char *key, const char *password);
+
+private:
+  AsyncServer _tcp;  // the composed pure-TCP server
+};
+#endif
 #endif
 
 #endif /* ASYNCTCP_H_ */
