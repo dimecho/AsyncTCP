@@ -41,7 +41,7 @@ const char *AP_PASSWORD = "12345678";  // min 8 chars
 #if defined(ESP8266)
 // Chunk size (raw bytes) - keep comfortably below the 4096-byte BearSSL
 // inbound record buffer once TLS + HTTP headers are added.
-#define OTA_CHUNK 1990
+#define OTA_CHUNK 3000
 #else
 #define OTA_CHUNK 0  // 0 => whole file in a single POST
 #endif
@@ -122,6 +122,12 @@ struct OtaRequest {
   bool   responded   = false;
 };
 
+#ifdef ESP8266
+static String otaUpdateError() { return Update.getErrorString(); }
+#else
+static String otaUpdateError() { return Update.errorString(); }
+#endif
+
 // Firmware update session - spans the chunked requests on ESP8266.
 static bool   fwSessionStarted = false;
 static size_t fwExpectedBytes  = 0;
@@ -197,8 +203,8 @@ static void sendResponse(AsyncClient *client, int code,
     "\r\n",
     code == 200 ? "200 OK" : "500 Internal Server Error",
     (unsigned)bodyLen);
-  client->write((const uint8_t *)header, headerLen);
-  client->write((const uint8_t *)body, bodyLen);
+  client->write((const char *)header, headerLen);
+  client->write((const char *)body, bodyLen);
   client->close();
 }
 
@@ -228,7 +234,7 @@ static void handleBody(OtaRequest *r, const uint8_t *data, size_t len) {
 #endif
     if (!ok) {
       fwOtaError = true;
-      String err = Update.errorString();
+      String err = otaUpdateError();
       Serial.printf("[OTA] Update.begin failed: %s\n", err.c_str());
     } else {
       Serial.printf("[OTA] begin: %s (%u bytes, chunk %u)\n",
@@ -238,9 +244,9 @@ static void handleBody(OtaRequest *r, const uint8_t *data, size_t len) {
   }
 
   if (!fwOtaError && len) {
-    if (Update.write(data, len) != len) {
+    if (Update.write(const_cast<uint8_t *>(data), len) != len) {
       fwOtaError = true;
-      String err = Update.errorString();
+      String err = otaUpdateError();
       Serial.printf("[OTA] Update.write failed: %s\n", err.c_str());
     } else {
       fwReceivedBytes += len;
@@ -254,7 +260,7 @@ static void handleBody(OtaRequest *r, const uint8_t *data, size_t len) {
     if (!fwOtaError) {
       if (!Update.end(true)) {
         fwOtaError = true;
-        String err = Update.errorString();
+        String err = otaUpdateError();
         Serial.printf("[OTA] Update.end failed: %s\n", err.c_str());
       } else {
         done = "Update Success!";
@@ -283,7 +289,11 @@ static void handleBody(OtaRequest *r, const uint8_t *data, size_t len) {
 static void processData(OtaRequest *r, AsyncClient *client,
                         const uint8_t *data, size_t len) {
   if (!r->headersDone) {
+#ifdef ESP8266
+    r->header.concat((const char *)data, len);
+#else
     r->header += String((const char *)data, len);
+#endif
     int mark = r->header.indexOf("\r\n\r\n");
     if (mark < 0) {
       if (r->header.length() > 2048) r->header.remove(0, 1024);  // header cap
@@ -332,8 +342,8 @@ static void processData(OtaRequest *r, AsyncClient *client,
         "Content-Length: %d\r\n"
         "Connection: close\r\n"
         "\r\n", pageLen);
-      client->write((const uint8_t *)header, headerLen);
-      client->write((const uint8_t *)page, pageLen);
+      client->write((const char *)header, headerLen);
+      client->write((const char *)page, pageLen);
       client->close();
       r->responded = true;
       return;
@@ -376,7 +386,7 @@ void onClient(void *arg, AsyncClient *client) {
   }, r);
 }
 
-AsyncServer *sslServer = NULL;
+AsyncSecureServer *sslServer = NULL;
 
 void setup() {
   Serial.begin(115200);
@@ -387,7 +397,7 @@ void setup() {
   Serial.printf("\nAP SSID: %s  IP: %s\n", AP_SSID,
                 WiFi.softAPIP().toString().c_str());
 
-  sslServer = new AsyncServer(443);
+  sslServer = new AsyncSecureServer(443);
   sslServer->onClient(onClient, NULL);
   sslServer->beginSecure(SERVER_CERT, SERVER_KEY, "");
 

@@ -102,7 +102,7 @@ lTBcpdzS+qPAH9M8SQ5mz4cV1QqfCV5SCwhIAC7N/ZmYuq7/e9sEck1+Bv1CBjag
 -----END ENCRYPTED PRIVATE KEY-----
 )EOF";
 
-AsyncServer *sslServer = NULL;
+AsyncSecureServer *sslServer = NULL;
 
 static void sendResponse(AsyncClient *client, int code, const char *contentType,
                          const char *body, size_t bodyLen) {
@@ -143,7 +143,12 @@ void onClient(void *arg, AsyncClient *client) {
   if (!client) return;
 
   client->onData([](void *arg, AsyncClient *client, void *data, size_t len) {
+#ifdef ESP8266
+    String request;
+    request.concat((const char *)data, len);
+#else
     String request((const char *)data, len);
+#endif
 
     if (request.startsWith("GET /api")) {
       char json[128];
@@ -175,7 +180,7 @@ void setup() {
   delay(500);
   Serial.printf("\nAP SSID: %s  IP: %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 
-  sslServer = new AsyncServer(443);
+  sslServer = new AsyncSecureServer(443);
   sslServer->onClient(onClient, NULL);
   sslServer->beginSecure(SERVER_CERT, SERVER_KEY, "test123");
 

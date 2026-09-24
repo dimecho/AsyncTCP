@@ -1,10 +1,10 @@
 /*
  * AsyncTCP - ClientSSL example
  *
- * ESP32 HTTPS client with mutual TLS (mTLS) using AsyncTCP + AsyncSecureSession.
+ * ESP32 HTTPS client with TLS using AsyncTCP + AsyncSecureClient.
  * Connects to a server, presents a client certificate, and verifies the
  * server using a shared CA. The server must request client certificates
- * for mTLS to take effect.
+ * for TLS to take effect.
  *
  * Includes a ready-to-use test PKI (key password: test123):
  *   - CA cert   — shared trust root for both client and server
@@ -33,7 +33,7 @@
  *     -pass pass:test123 -CAfile ca.pem -Verify 1 -www -port 4433
  *
  * Compile with:
- *   compiler.cpp.extra_flags=-DASYNC_TCP_SSL_ENABLED=1 -DASYNC_TCP_SSL_ENABLE_PKCS8_PASSWORD=1
+ *   compiler.cpp.extra_flags=-DASYNC_TCP_SSL_ENABLED=1
  */
 
 #ifdef ESP8266
@@ -171,30 +171,51 @@ void setup() {
   Serial.printf("\nIP: %s\n", WiFi.localIP().toString().c_str());
 
   sslClient = new AsyncClient();
+  // onConnect fires when the TLS handshake completes (not on TCP connect).
   sslClient->onConnect(onConnected);
   sslClient->onData(onData);
   sslClient->onDisconnect(onDisconnect);
   sslClient->onError(onError);
 
-  Serial.printf("[Client] Connecting to %s:%u\n", SERVER_HOST, SERVER_PORT);
+  // Create a TLS session, configure its credentials, and attach it BEFORE
+  // connecting. AsyncClient starts the handshake automatically once TCP is up.
+  AsyncSecureSession *session = new (std::nothrow) AsyncSecureSession();
+  if (!session) {
+    Serial.println("[Client] failed to allocate TLS session");
+    delete sslClient;
+    sslClient = NULL;
+    return;
+  }
 
+#ifdef ESP8266
+  // ESP8266/BearSSL session API: no server-cert verification support;
+  // connects without it (the 8-arg API below is ESP32/mbedTLS only).
+  session->setClientCredentials(SERVER_HOST, NULL);
+#else
   // --- With server verification (recommended) ---
-  bool ok = sslClient->beginSecure(
-      SERVER_HOST, SERVER_PORT,
-      CA_CERT,
-      CLIENT_CERT, CLIENT_KEY,
+  session->setClientCredentials(SERVER_HOST,
+      (const unsigned char *)CA_CERT, strlen(CA_CERT),
+      (const unsigned char *)CLIENT_CERT, strlen(CLIENT_CERT),
+      (const unsigned char *)CLIENT_KEY, strlen(CLIENT_KEY),
       "test123");
+#endif
 
   // --- Without server verification (skip CA check) ---
   // WARNING: do NOT use in production — defeats the purpose of TLS.
-  // bool ok = sslClient->beginSecure(
-  //     SERVER_HOST, SERVER_PORT,
-  //     NULL,              // no CA — server cert is not verified
-  //     CLIENT_CERT, CLIENT_KEY,
+  // session->setClientCredentials(SERVER_HOST,
+  //     NULL, 0,
+  //     (const unsigned char *)CLIENT_CERT, strlen(CLIENT_CERT),
+  //     (const unsigned char *)CLIENT_KEY, strlen(CLIENT_KEY),
   //     "test123");
 
+  sslClient->setHooks(new SecureClientHooks(session, sslClient));
+
+  Serial.printf("[Client] Connecting to %s:%u\n", SERVER_HOST, SERVER_PORT);
+
+  bool ok = sslClient->connect(SERVER_HOST, SERVER_PORT);
+
   if (!ok) {
-    Serial.println("[Client] beginSecure failed");
+    Serial.println("[Client] connect failed");
     delete sslClient;
     sslClient = NULL;
     return;
