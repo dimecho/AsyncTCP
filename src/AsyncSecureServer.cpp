@@ -181,49 +181,11 @@ int8_t SecureServerHooks::_acceptTls(tcp_pcb *pcb) {
                     accept_heap < SSL_PRESSURE_FLOOR ||
                     cachedMaxBlock < SSL_SERVE_BLOCK;
     if (needPark) {
-      // Don't park if the allocator can't carve a slab — a new parked conn
-      // just pins more heap with no path to promotion.  Shedding existing
-      // slots via _promoteSlot's desperation-wash will eventually recover.
-      bool fragmented = cachedMaxBlock < (SSL_SERVE_BLOCK / 4);
-      if (s_async_parked_tls < SSL_PARKED_SLOTS &&
-          accept_heap >= SSL_PARKED_MIN_HEAP && !fragmented) {
-        struct pending_pcb *new_item = park_alloc();
-        if (new_item) {
-          new_item->pcb = pcb;
-          new_item->pb = NULL;
-          new_item->pb_len = 0;
-          new_item->parked_ms = millis();
-          new_item->next = NULL;
-          tcp_arg(pcb, this);
-          // Slow park-tick: promote is instant via _conn_done; the poll here only
-          // serves idle-shed (30s), page-flush and orphan close, so 1s intervals
-          // cut the event-queue pressure (and "coalescing polls" warnings) 4x.
-          tcp_poll(pcb, &_s_poll_cb, 4);
-          tcp_recv(pcb, &_s_recv_cb);
-          tcp_err(pcb, &_s_error_cb);
-          // Append at the tail so _promoteSlot lifts in arrival order (FIFO).
-          if (!_pending) {
-            _pending = new_item;
-          } else {
-            struct pending_pcb *tail = _pending;
-            while (tail->next) {
-              tail = tail->next;
-            }
-            tail->next = new_item;
-          }
-          s_async_parked_tls++;
-          if (live_conn) {
-            async_tcp_log_d("_accept: live conn, queued new conn (queued=%u/%d)", s_async_parked_tls, SSL_PARKED_SLOTS);
-          } else {
-            async_tcp_log_d("_accept: below serve floor, parked TLS conn (queued=%u/%d)", s_async_parked_tls, SSL_PARKED_SLOTS);
-          }
-          return ERR_OK;
-        }
-      }
-      // Genuinely overloaded (park queue full, heap under 2KB, or live conn
-      // low on heap) — RST; browser retry backs off instead of re-parking,
-      // and the live serve self-heals by freeing its slabs on SETTLED.
-      async_tcp_log_d("_accept: queue busy (queued=%u/%d), refusing TLS conn", s_async_parked_tls, SSL_PARKED_SLOTS);
+      // ESP8266: no parking — with keep-alive responses the browser reuses a
+      // single connection, so extra conns are rare; parking just pinned heap.
+      // Refuse (RST): the peer retries or reuses its existing TLS conn.
+      async_tcp_log_d("_accept: TLS busy (live=%u heap=%u maxblock=%u), refusing conn",
+                      (unsigned)ssl_cnt, accept_heap, (unsigned)cachedMaxBlock);
       tcp_abort(pcb);
       return ERR_ABRT;
     }

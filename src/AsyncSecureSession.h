@@ -135,11 +135,20 @@ class AsyncClient;  // forward decl; AsyncSecureSession.h is included before Asy
 // (spelled in the shared config above; no server counterpart — see note above).
 
 // Force-close for a serve with zero engine progress (e.g. send-pool stall).
-// 20s: slow enough that a wedged serve's own lwIP close/ack latency settles
-// before we force TBS free (avoids racing retransmit segments against the
-// slab, which surfaced as a poison-block heap crash at 5s).
+// 4s: on a starved 8266 heap a stalled record never recovers (no heap for TX
+// pbufs -> no TX -> no ACK -> nothing frees), so sitting 20s just delays the
+// browser's retry. Note: below ~5s this raced retransmit segments against the
+// freed slab (poison-block heap crash) — do not go lower without retesting.
 #ifndef SSL_STALL_RESET_MS
-#define SSL_STALL_RESET_MS 20000
+#define SSL_STALL_RESET_MS 4000
+#endif
+
+// Idle teardown (conn alive but nothing to deliver): separate budget.
+// Must be comfortably ABOVE stall-kill — a conn with an engine-deferred
+// record (SENDREC pending) shows an empty TCP queue, which looks "idle";
+// the stall timer handles that case, idle is only for abandoned conns.
+#ifndef SSL_IDLE_RESET_MS
+#define SSL_IDLE_RESET_MS 20000
 #endif
 
 // Free heap floor for accept/park/promote; refuse if below. Keeps headroom for slab + app burst.
@@ -149,9 +158,9 @@ class AsyncClient;  // forward decl; AsyncSecureSession.h is included before Asy
 #endif
 
 // Parked-conn queue admission floor: below this even the 24B queue malloc
-// would throw (OOM). Above it, always admit the raw pcb; the ClientHello is
-// only buffered into heap when free heap also clears PRESSURE_FLOOR (else
-// it parks in lwIP's recv window — kernel pool, no heap).
+// would throw (OOM). Above it, admit the raw pcb; the ClientHello is only
+// buffered into heap when free heap also clears PRESSURE_FLOOR (else it
+// parks in lwIP's recv window — kernel pool, no heap).
 #ifndef SSL_PARKED_MIN_HEAP
 #define SSL_PARKED_MIN_HEAP 2000
 #endif
@@ -462,6 +471,12 @@ public:
     bool isStalled(uint32_t stall_ms);
     // True while the engine still holds a TLS record not yet in TCP.
     bool txBusy(void);
+
+    // True while the BearSSL engine pump is QUEUED/DROPPED — i.e. a deferred
+    // engine run will emit records later. txBusy() alone misses this: a
+    // deferred record is not in the TCP send queue yet, so a conn with one
+    // pending reads as "idle".
+    bool engineBusy(void);
 
     // Release TLS state and close the underlying transport.
     void close(void);

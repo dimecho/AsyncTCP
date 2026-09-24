@@ -1820,6 +1820,10 @@ bool AsyncSecureSession::txBusy(void) {
   return _pcb ? tcp_ssl_tx_busy(_pcb) : false;
 }
 
+bool AsyncSecureSession::engineBusy(void) {
+  return _ssl && _ssl->engine_pump_state != ENGINE_PUMP_IDLE;
+}
+
 void AsyncSecureSession::close(void) {
   if (_pcb) {
     tcp_ssl_close(_pcb);

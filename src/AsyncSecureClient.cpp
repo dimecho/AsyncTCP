@@ -208,11 +208,13 @@ bool SecureClientHooks::onPoll(AsyncClient *c) {
   }
   // Silent-live teardown (browser stop/abort recovery): a conn gone fully
   // idle — no inbound data, nothing unacked on the wire, send window drained
-  // — has nothing more to deliver; free it after the stall window so a parked
-  // refresh conn promotes instead of waiting on a wedged conn.
+  // — has nothing more to deliver; free it after the idle window so a parked
+  // refresh conn promotes instead of waiting on a wedged conn. NOTE: this
+  // must use IDLE (not STALL) timing — a conn with an engine-deferred record
+  // reads as "empty TCP queue" and would be killed mid-transfer otherwise.
   if (sess->handshakeDone() &&
-      (now - lastRx(c)) >= SSL_STALL_RESET_MS &&
-      !sess->txBusy() && tcp_sndbuf(pcb) != 0) {
+      (now - lastRx(c)) >= SSL_IDLE_RESET_MS &&
+      !sess->txBusy() && !sess->engineBusy() && tcp_sndbuf(pcb) != 0) {
     async_tcp_log_d("SSL conn idle (browser abort?), closing to free slot, sndbuf=%u space=%u", (unsigned)tcp_sndbuf(pcb), (unsigned)c->space());
     c->close();
     return true;

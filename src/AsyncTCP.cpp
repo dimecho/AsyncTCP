@@ -1871,6 +1871,16 @@ err_t AsyncTCP_detail::tcp_accept(void *arg, tcp_pcb *pcb, err_t err) {
     return ERR_ABRT;
   }
   auto server = reinterpret_cast<AsyncServer *>(arg);
+#if ASYNC_TCP_SSL_ENABLED
+  // TLS admission hook (park/serve queue, nagle, serve floors). Returns -1 to
+  // fall through to the plain accept below (hook present but not configured).
+  if (server->_tls_server_hooks) {
+    int8_t r = server->_tls_server_hooks->onAccept(server, pcb, (int8_t)err);
+    if (r != -1) {
+      return (err_t)r;
+    }
+  }
+#endif
   if (server->_connect_cb) {
     AsyncClient *c = new (std::nothrow) AsyncClient(pcb);
     if (c && c->pcb()) {
