@@ -130,6 +130,10 @@
 
 // Timed-statement log wrapper. EXPANDS at the use site: `statement` runs
 // between two micros() reads, so the enclosing TU must provide micros().
+// The micros() calls cost real cycles even when verbose logging is compiled
+// out (the optimizer can't prove them dead), so timing is opt-in via
+// ASYNC_TCP_VERBOSE_TIMING.
+#ifdef ASYNC_TCP_VERBOSE_TIMING
 #define async_tcp_log_elapsed(tag, statement)                          \
   {                                                                    \
     [[maybe_unused]]                                                   \
@@ -137,3 +141,6 @@
     statement;                                                         \
     async_tcp_log_v("%s took %" PRIu32 " us", tag, micros() - s_time); \
   }
+#else
+#define async_tcp_log_elapsed(tag, statement) { statement; }
+#endif

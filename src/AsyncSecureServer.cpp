@@ -25,26 +25,12 @@ extern "C" {
 // ===== begin BearSSL/ESP8266 AsyncSecureServer (AsyncTCP) =====
 
 #if ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_SERVER
-// Number of TLS conns parked in the bounded queue (SSL_PARKED_SLOTS
-// slots, FIFO over the pending_pcb list).
-static volatile int s_async_parked_tls = 0;
-
-uint8_t tcp_ssl_parked_count() {
-  return (uint8_t)s_async_parked_tls;
-}
-
-// Page-finished flush request. SETTLED (last TLS conn drained) raises this;
-// AsyncServer::_poll drains the whole parked queue on its next tick. Parked
-// raw pcbs pin the PREVIOUS page's pre-connect/retry pbuf chains and can hold
-// free heap below the admission bar; flushing them at page-finish lets the
-// arena coalesce before the NEXT refresh burst (instead of waiting out the
-// 20s idle shed).
-static volatile bool s_shed_requested = false;
-
-void tcp_ssl_shed_parked() {
-  s_shed_requested = true;
-}
-
+// ESP8266 has no parked-conn queue: with SSL_MAX_CONNECTIONS=1 a parked
+// ClientHello can never become a parallel serve and only pins heap/pbufs the
+// live conn needs. Busy conns are refused instead (see _acceptTls). Kept as
+// no-op stubs — the BearSSL glue still calls them.
+uint8_t tcp_ssl_parked_count() { return 0; }
+void tcp_ssl_shed_parked() {}
 #endif
 
 // All AsyncSecureServer definitions below live inside this guard; the class
@@ -54,10 +40,9 @@ void tcp_ssl_shed_parked() {
 // TLS server hook: owns the cert context, the parked-conn queue and the
 // per-connection serve/promotion. Created by AsyncServer::beginSecure().
 struct SecureServerHooks : AsyncServerHooks {
-  explicit SecureServerHooks(AsyncServer *srv) : _srv(srv), _pending(NULL), _ssl_ctx(NULL), _file_cb(NULL), _file_cb_arg(NULL) {}
+  explicit SecureServerHooks(AsyncServerImpl *srv) : _srv(srv), _ssl_ctx(NULL), _file_cb(NULL), _file_cb_arg(NULL) {}
 
-  int8_t onAccept(AsyncServer *srv, tcp_pcb *pcb, int8_t err) override;
-  void onConnDone(AsyncServer *srv, AsyncClient *client) override;
+  int8_t onAccept(AsyncServerImpl *srv, tcp_pcb *pcb, int8_t err) override;
 
   void beginSecure(const char *cert, const char *private_key_file, const char *password);
   void onSslFileRequest(AcSSLFileHandler cb, void *arg) {
@@ -65,17 +50,8 @@ struct SecureServerHooks : AsyncServerHooks {
     _file_cb_arg = arg;
   }
 
-  static void connDoneThunk(void *arg, AsyncClient *client) {
-    (void)client;
-    SecureServerHooks *h = static_cast<SecureServerHooks *>(arg);
-    if (h) {
-      h->_promoteSlot();
-    }
-  }
-
 private:
-  AsyncServer *_srv;
-  struct pending_pcb *_pending;  // parked queue (FIFO, p->pb buffered)
+  AsyncServerImpl *_srv;
   BearSSL_SSL_CTX *_ssl_ctx;
   AcSSLFileHandler _file_cb;
   void *_file_cb_arg;
@@ -84,15 +60,6 @@ private:
   AsyncClient *_serveTls(tcp_pcb *pcb);
   int _cert(const char *filename, uint8_t **buf);
   static int _s_cert(void *arg, const char *filename, uint8_t **buf);
-  int8_t _s_poll(tcp_pcb *pcb);
-  int8_t _s_recv(struct tcp_pcb *pcb, struct pbuf *pb, int8_t err);
-  void _s_error(int8_t err);
-  int8_t _promoteSlot(void);
-  void _conn_done(AsyncClient *client);
-  static err_t _s_poll_cb(void *arg, struct tcp_pcb *tpcb);
-  static err_t _s_recv_cb(void *arg, struct tcp_pcb *tpcb, struct pbuf *pb, err_t err);
-  static void _s_error_cb(void *arg, err_t err);
-  static void _s_conn_done_cb(void *arg, AsyncClient *client);
 };
 
 AsyncSecureServer::AsyncSecureServer(ip_addr_t addr, uint16_t port)
@@ -200,7 +167,7 @@ AsyncClient *SecureServerHooks::_serveTls(tcp_pcb *pcb) {
   // Promote a raw pcb to a live TLS AsyncClient. The session ctor allocates
   // ctx+buffers and registers the pcb, so ssl_count flips >0 inside. Returns
   // NULL (pcb closed) if allocation fails — browser simply retries.
-  // Hard live-budget cap (same as _promoteSlot): never serve past
+  // Hard live-budget cap: never serve past
   // SSL_MAX_CONNECTIONS, regardless of admission path. Each serve holds a
   // ~SLAB heap alloc, so exceeding the budget splits the arena (slow chunks).
   if (tcp_ssl_client_count() >= SSL_MAX_CONNECTIONS) {
@@ -231,7 +198,7 @@ AsyncClient *SecureServerHooks::_serveTls(tcp_pcb *pcb) {
       }
       return NULL;
     }
-    SecureClientHooks *hooks = new (std::nothrow) SecureClientHooks(ssl, c);
+    SecureClientHooks *hooks = new (std::nothrow) SecureClientHooks(ssl, c->impl());
     if (!hooks) {
       async_tcp_log_d("_serveTls: SecureClientHooks alloc failed, connection aborted!");
       delete ssl;
@@ -250,11 +217,6 @@ AsyncClient *SecureServerHooks::_serveTls(tcp_pcb *pcb) {
         h->notifyClient(h->_srv, c);
       }
     }, this);
-    // Instant slot promote: when this live conn tears down (its TLS buffers
-    // already freed), promote any queued conn right away instead of waiting
-    // for the next _poll tick. AsyncClient::_close()/_s_error() fire
-    // _server_discard_cb at teardown.
-    doPromote(c, connDoneThunk, this);
     return c;
   }
   async_tcp_log_d("_serveTls: new AsyncClient() failed, connection aborted!");
@@ -276,247 +238,10 @@ int SecureServerHooks::_s_cert(void *arg, const char *filename, uint8_t **buf) {
   return reinterpret_cast<SecureServerHooks *>(arg)->_cert(filename, buf);
 }
 
-int8_t SecureServerHooks::_s_poll(tcp_pcb *pcb) {
-  // Queue driver for the parked conns: promotes the FIFO head the moment the
-  // live conn is gone and heap clears the serve bar; sheds any slot queued
-  // past idle.
-  uint32_t now_ms = millis();
-  struct pending_pcb *p = _pending;
-  while (p && p->pcb != pcb) {
-    p = p->next;
-  }
-  if (!p) {
-    // Orphaned pcb: a peer-error cleared the queue, but this pcb survived.
-    // Walked by our poll tick — close it so the tcp_pcb isn't leaked (lwIP
-    // leaves callbacks set, so we must null them first).
-    shed_parked_pcb(pcb);
-    return ERR_ABRT;
-  }
-
-  bool is_head = (p == _pending);
-  // Page-finished flush: a SETTLED drain (count hit 0) requested we shed the
-  // whole queue so the arena coalesces before the next refresh burst. Queued
-  // pcbs are retry-able (browser reconnects), so RST'ing them is safe.
-  if (tcp_ssl_client_count() < SSL_MAX_CONNECTIONS && s_shed_requested) {
-    s_shed_requested = false;
-    int shed = abort_queued_items(&_pending, &s_async_parked_tls);
-    async_tcp_log_d("_poll: shed %d queued (arena flush after page done), freeheap=%u, maxblock=%u",
-                    shed, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize());
-    // Our pcb was in the drained set (every queued pcb is drained) — abort.
-    return ERR_ABRT;
-  }
-  if (is_head && tcp_ssl_client_count() < SSL_MAX_CONNECTIONS) {
-    return _promoteSlot();
-  }
-
-  // Slot queued past idle timeout -> live conn wedged; shed so pcb+pbufs
-  // return to the heap and the browser retries on a fresh connection.
-  if ((uint32_t)(now_ms - p->parked_ms) < SSL_QUEUE_IDLE_MS) {
-    return ERR_OK;
-  }
-  unlink_pending(&_pending, p);
-  s_async_parked_tls--;
-  async_tcp_log_d("_poll: shedding queued conn (parked=%ums, freeheap=%u, maxblock=%u)", (unsigned)(now_ms - p->parked_ms), (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxFreeBlockSize());
-  p->pcb = NULL;
-  if (p->pb) {
-    pbuf_free(p->pb);
-    p->pb = NULL;
-  }
-  shed_parked_pcb(pcb);
-  return ERR_ABRT;
-}
-
-int8_t SecureServerHooks::_s_recv(struct tcp_pcb *pcb, struct pbuf *pb, int8_t err) {
-  (void)err;
-  // Find the queued pcb in the parked queue; buffered ClientHello rides in
-  // p->pb. Searching only _pending dropped a below-floor conn's ClientHello,
-  // so the promoted conn waited forever for one that never came.
-  struct pending_pcb *p = _pending;
-  while (p && p->pcb != pcb) {
-    p = p->next;
-  }
-  if (!p) {
-    if (pb) {
-      pbuf_free(pb);
-    }
-    return ERR_OK;
-  }
-
-  if (!pb) {
-    // Peer closed the queued connection before it was served — release it.
-    // shed_parked_pcb nulls the callbacks BEFORE aborting so tcp_abort's
-    // synchronous err callback cannot re-enter _s_error() and double-drain.
-    unlink_pending(&_pending, p);
-    p->pcb = NULL;
-    if (p->pb) {
-      pbuf_free(p->pb);
-    }
-    s_async_parked_tls--;
-    shed_parked_pcb(pcb);
-    return ERR_ABRT;
-  } else {
-    // Buffer request bytes; _poll feeds them to the promoted conn.
-    // BROWSER-BURST CAP: a parked conn's inbound HTTP request must NOT be
-    // bulk-buffered into system heap. We buffer only a small prefix
-    // (ClientHello + request head), and once the cap is hit we REFUSE the rest:
-    // returning any non-ERR_OK/non-ERR_ABRT makes lwIP stash the pbuf in
-    // pcb->refused_data (tcp_in.c) — kernel owns it, window stays shut, and it
-    // is re-delivered to whomever attaches a recv callback next (the promoted
-    // AsyncClient drains it). ERR_OK here would leak the pbuf AND lose its
-    // bytes (lwIP hands ownership to the app and never re-delivers).
-    uint16_t inc = pb ? pb->tot_len : 0;
-    if (p->pb_len + inc <= SSL_PARKED_RX_CAP) {
-      if (p->pb) {
-        pbuf_chain(p->pb, pb);
-      } else {
-        p->pb = pb;
-      }
-      p->pb_len += inc;
-    } else {
-      return ERR_MEM;
-    }
-  }
-  return ERR_OK;
-}
-
-void SecureServerHooks::_s_error(int8_t err) {
-  (void)err;
-  // Peer reset/errored a queued raw pcb before promotion; lwIP already freed
-  // that pcb (tcp_err carries no pcb), so release bookkeeping. Any queued pcb
-  // that survived its peer's teardown is orphaned and gets shed by _poll on
-  // its next 4s tick.
-  free_queued_items(&_pending, &s_async_parked_tls);
-}
-
-int8_t SecureServerHooks::_promoteSlot() {
-  // Cache expensive queries once per promote
-  size_t cachedMaxBlock = ESP.getMaxFreeBlockSize();
-  int promote_heap = ESP.getFreeHeap();
-  uint8_t ssl_cnt = tcp_ssl_client_count();
-  // Lifts the queued raw PCB at the head to a live AsyncClient (its ClientHello,
-  // if buffered above the serve floor, is fed in at the end -> fastest
-  // handshake). Runs whenever a live slot is free (TLS buffers freed, count <
-  // SSL_MAX_CONNECTIONS) — either from _poll's tick or instantly from
-  // _conn_done. No heap bar below the serving floor: _serveTls is
-  // allocation-gated (nothrow fails cleanly, pcb aborted, retried), but a serve
-  // burns several KB mid-flight, so below PRESSURE_PARK_FLOOR we keep the slot
-  // queued and retry on the next tick — the arena recovers to its floor after
-  // each conn frees its TLS buffers.
-  // Hard live-budget cap: never promote past SSL_MAX_CONNECTIONS. Each serve
-  // holds a ~SLAB heap alloc, so exceeding the budget multiplies the arena we
-  // must keep under PRESSURE_FLOOR. When a live conn finishes, _conn_done drops
-  // the count and re-enters this path, so the queue still drains promptly.
-  if (ssl_cnt >= SSL_MAX_CONNECTIONS) {
-    return ERR_OK;
-  }
-  struct pending_pcb *p = _pending;
-  if (!p) {
-    return ERR_OK;
-  }
-#if ASYNC_TCP_SSL_ENABLED && ASYNC_TCP_SSL_ENABLE_SERVER
-  // Same serve gate as _accept: free heap >= SSL_PRESSURE_FLOOR AND maxblock >=
-  // slab. SERVE_BLOCK must stay exactly the slab size — slab+margin (or 9000)
-  // refuses every conn while maxblock sits under it. Below SSR, keep queued,
-  // retry next tick.
-  if ((unsigned)promote_heap < SSL_PRESSURE_FLOOR ||
-      cachedMaxBlock < SSL_SERVE_BLOCK) {
-    // Head-wedge guard: a below-floor head can't serve, but _poll returns it
-    // straight here so its buffered ClientHello is never shed, pinning the
-    // heap under the floor forever. After idle, abort it; browser retries.
-    struct pending_pcb *w = _pending;
-    if (w && (uint32_t)(millis() - w->parked_ms) >= SSL_QUEUE_IDLE_MS) {
-      tcp_pcb *wpcb = w->pcb;
-      _pending = w->next;
-      s_async_parked_tls--;
-      w->pcb = NULL;
-      if (w->pb) {
-        pbuf_free(w->pb);
-      }
-      async_tcp_log_d("_promoteSlot: shedding queued head (parked=%ums, freeheap=%u, maxblock=%u)", (unsigned)(millis() - w->parked_ms), (unsigned)promote_heap, (unsigned)cachedMaxBlock);
-      shed_parked_pcb(wpcb);
-      return ERR_ABRT;
-    }
-    // Self-sabotage guard: buffered ClientHellos are heap pins, so freeheap
-    // reads BELOW the arena a shed would recover (each ≤ SSL_PARKED_RX_CAP).
-    // If pins alone hold the serve under the floor, wash the whole queue (RST;
-    // browser retries into a clean serve) instead of parking forever.
-    unsigned pinned = (unsigned)s_async_parked_tls * SSL_PARKED_RX_CAP;
-    if ((unsigned)promote_heap < SSL_PRESSURE_FLOOR && (unsigned)promote_heap + pinned >= SSL_PRESSURE_FLOOR) {
-      // Whole queue freed by abort_queued_items; nothing left to promote. Return
-      // ERR_OK (not ERR_ABRT) so we don't double-abort a pcb that was just freed.
-      // Fresh conns re-enter via _accept on the next tick.
-      int washed = abort_queued_items(&_pending, &s_async_parked_tls);
-      async_tcp_log_d("_promoteSlot: washing pinned queue (freeheap=%u pins=%u washed=%u)", (unsigned)promote_heap, pinned, washed);
-      return ERR_OK;
-    }
-    // Desperation: maxblock so low that no TLS slab can ever be carved —
-    // parked pbufs are dead weight pinning heap we can't use. Wash to
-    // consolidate. The self-sabotage guard above doesn't cover this when
-    // heap+pinned < FLOOR, but that's exactly the stuck-spin case.
-    if (cachedMaxBlock < (SSL_SERVE_BLOCK / 4)) {
-      int washed = abort_queued_items(&_pending, &s_async_parked_tls);
-      async_tcp_log_d("_promoteSlot: desperation wash (freeheap=%u maxblock=%u washed=%u)", (unsigned)promote_heap, (unsigned)cachedMaxBlock, washed);
-      return ERR_OK;
-    }
-    async_tcp_log_d("_promoteSlot: freeheap=%u maxblock=%u below serve floor, keeping slot queued", (unsigned)promote_heap, (unsigned)cachedMaxBlock);
-    return ERR_OK;
-  }
-#endif
-  tcp_pcb *pcb = p->pcb;
-  _pending = p->next;  // next queued conn slides into the head
-  s_async_parked_tls--;
-  p->pcb = NULL;
-  pbuf *staged = p->pb;
-  p->pb = NULL;
-  AsyncClient *c = _serveTls(pcb);
-  err_t err = ERR_OK;
-  if (c) {
-    // Feed the request-header pbufs that arrived while queued straight into
-    // the now-live client (ClientHello sits at the head).
-    if (staged) {
-      feedPbuf(c, staged);
-    }
-  } else {
-    if (staged) {
-      pbuf_free(staged);
-    }
-  }
-  return err;
-}
-
-void SecureServerHooks::_conn_done(AsyncClient *client) {
-  (void)client;
-  // Live conn tore down (its TLS buffers already freed) — promote the queued
-  // conn immediately instead of waiting for the next _poll tick.
-  _promoteSlot();
-}
-
-err_t SecureServerHooks::_s_poll_cb(void *arg, struct tcp_pcb *pcb) {
-  return reinterpret_cast<SecureServerHooks *>(arg)->_s_poll(pcb);
-}
-
-err_t SecureServerHooks::_s_recv_cb(void *arg, struct tcp_pcb *pcb, struct pbuf *pb, err_t err) {
-  return reinterpret_cast<SecureServerHooks *>(arg)->_s_recv(pcb, pb, err);
-}
-
-void SecureServerHooks::_s_error_cb(void *arg, err_t err) {
-  if (!arg) {
-    return;
-  }
-  reinterpret_cast<SecureServerHooks *>(arg)->_s_error(err);
-}
-
-void SecureServerHooks::_s_conn_done_cb(void *arg, AsyncClient *client) {
-  if (!arg) {
-    return;
-  }
-  reinterpret_cast<SecureServerHooks *>(arg)->_conn_done(client);
-}
-
 // --- SecureServerHooks: TLS admission + promotion, dispatched from
 // AsyncServer's accept/close paths ---
 
-int8_t SecureServerHooks::onAccept(AsyncServer *srv, tcp_pcb *pcb, int8_t err) {
+int8_t SecureServerHooks::onAccept(AsyncServerImpl *srv, tcp_pcb *pcb, int8_t err) {
   (void)srv;
   (void)err;
   // TLS conns always flush each small record immediately (overrides the plain
@@ -527,38 +252,23 @@ int8_t SecureServerHooks::onAccept(AsyncServer *srv, tcp_pcb *pcb, int8_t err) {
   return _acceptTls(pcb);
 }
 
-void SecureServerHooks::onConnDone(AsyncServer *srv, AsyncClient *client) {
-  (void)srv;
-  (void)client;
-  // Live conn tore down (its TLS buffers already freed) — promote the queued
-  // conn immediately instead of waiting for the next _poll tick.
-  _promoteSlot();
-}
 #endif
 
 
 // --- AsyncServer backward-compat TLS entry points (ESP8266) ---
 // Configure + install the TLS server hooks on this plain server.
-void AsyncServer::onSslFileRequest(AcSSlFileHandler cb, void *arg) {
-  if (!_tls_server_hooks) {
-    SecureServerHooks *h = new (std::nothrow) SecureServerHooks(this);
-    if (!h) {
-      return;
-    }
-    setHooks(h);
+void AsyncServer::onSslFileRequest(std::function<int(void *arg, const char *filename, uint8_t **buf)> cb, void *arg) {
+  if (!_impl->hooks()) {
+    _impl->setHooks(new (std::nothrow) SecureServerHooks(_impl.get()));
   }
-  static_cast<SecureServerHooks *>(_tls_server_hooks)->onSslFileRequest(cb, arg);
+  static_cast<SecureServerHooks *>(_impl->hooks())->onSslFileRequest(cb, arg);
 }
 
 void AsyncServer::beginSecure(const char *cert, const char *private_key_file, const char *password) {
-  if (!_tls_server_hooks) {
-    SecureServerHooks *h = new (std::nothrow) SecureServerHooks(this);
-    if (!h) {
-      return;
-    }
-    setHooks(h);
+  if (!_impl->hooks()) {
+    _impl->setHooks(new (std::nothrow) SecureServerHooks(_impl.get()));
   }
-  static_cast<SecureServerHooks *>(_tls_server_hooks)->beginSecure(cert, private_key_file, password);
+  static_cast<SecureServerHooks *>(_impl->hooks())->beginSecure(cert, private_key_file, password);
 }
 
 void SecureServerHooks::beginSecure(const char *cert, const char *private_key_file, const char *password) {
@@ -583,13 +293,13 @@ void SecureServerHooks::beginSecure(const char *cert, const char *private_key_fi
 // TLS server hook: owns cert/key, the session cache and the parked-conn queue.
 // Created by AsyncServer::beginSecure().
 struct SecureServerHooks : AsyncServerHooks {
-  explicit SecureServerHooks(AsyncServer *srv)
+  explicit SecureServerHooks(AsyncServerImpl *srv)
       : _srv(srv), _use_ssl(false), _cert(NULL), _cert_len(0), _key(NULL), _key_len(0),
         _ssl_file_cb(NULL), _ssl_file_cb_arg(NULL), _ssl_key_password(NULL), _secureCtx() {}
 
-  int8_t onAccept(AsyncServer *srv, tcp_pcb *pcb, int8_t err) override;
-  int8_t onAccepted(AsyncServer *srv, AsyncClient *client) override;
-  void onConnDone(AsyncServer *srv, AsyncClient *client) override;
+  int8_t onAccept(AsyncServerImpl *srv, tcp_pcb *pcb, int8_t err) override;
+  int8_t onAccepted(AsyncServerImpl *srv, AsyncClient *client) override;
+  void onConnDone(AsyncServerImpl *srv, AsyncClient *client) override;
 
   bool beginSecure(const unsigned char *cert, size_t certLen,
       const unsigned char *key, size_t keyLen);
@@ -613,7 +323,7 @@ struct SecureServerHooks : AsyncServerHooks {
   }
 
 private:
-  AsyncServer *_srv;
+  AsyncServerImpl *_srv;
   bool _use_ssl;
   const unsigned char *_cert;
   size_t _cert_len;
@@ -719,7 +429,7 @@ int8_t SecureServerHooks::_acceptedTls(AsyncClient *client) {
         // Wires the session callbacks into the client's app callbacks and
         // takes over the pcb data path (installs the session's own
         // recv/sent/poll/err handlers on the pcb).
-        SecureClientHooks *hooks = new (std::nothrow) SecureClientHooks(ssl, client);
+        SecureClientHooks *hooks = new (std::nothrow) SecureClientHooks(ssl, client->impl());
         if (!hooks) {
           async_tcp_log_e("Failed to allocate client hooks");
           delete ssl;
@@ -732,9 +442,9 @@ int8_t SecureServerHooks::_acceptedTls(AsyncClient *client) {
         // parked-conn ClientHello) arrives via the client's normal recv events
         // on this async task, where hooks->onRecv drives feedRx + handshake.
         async_tcp_log_d("Server SSL context ready, handshake starts on first ClientHello");
-        if (pbuf *staged = takeStaged(client)) {
+        if (pbuf *staged = takeStaged(client->impl())) {
           async_tcp_log_d("_acceptedTls: staged feed %u bytes", (unsigned)staged->tot_len);
-          feedPbuf(client, staged);
+          feedPbuf(client->impl(), staged);
         }
       } else {
         async_tcp_log_e("startSSLServer failed: %d", ret);
@@ -802,13 +512,13 @@ int8_t SecureServerHooks::_serveTls(tcp_pcb *pcb, pbuf *staged) {
     c->setNoDelay(_srv->getNoDelay());
     doPromote(c, _s_conn_done_cb, this);
     if (staged) {
-      stageStaged(c, staged);
+      stageStaged(c->impl(), staged);
     }
     if (queueAccept(_srv, c)) {
       return ERR_OK;
     }
     async_tcp_log_e("_serveTls failed: couldn't allocate accept event");
-    detachPcb(c);
+    detachPcb(c->impl());
     tcp_abort(pcb);
     return ERR_ABRT;
   }
@@ -952,18 +662,18 @@ void SecureServerHooks::_conn_done(AsyncClient *client) {
 // --- SecureServerHooks: TLS admission + accepted-client setup, dispatched
 // from AsyncServer's accept/close paths ---
 
-int8_t SecureServerHooks::onAccept(AsyncServer *srv, tcp_pcb *pcb, int8_t err) {
+int8_t SecureServerHooks::onAccept(AsyncServerImpl *srv, tcp_pcb *pcb, int8_t err) {
   (void)srv;
   (void)err;
   return _acceptTls(pcb);
 }
 
-int8_t SecureServerHooks::onAccepted(AsyncServer *srv, AsyncClient *client) {
+int8_t SecureServerHooks::onAccepted(AsyncServerImpl *srv, AsyncClient *client) {
   (void)srv;
   return _acceptedTls(client);
 }
 
-void SecureServerHooks::onConnDone(AsyncServer *srv, AsyncClient *client) {
+void SecureServerHooks::onConnDone(AsyncServerImpl *srv, AsyncClient *client) {
   (void)srv;
   (void)client;
   _conn_done(client);
@@ -1025,26 +735,18 @@ void SecureServerHooks::setDefaultKeyPEM(const char *keyPEM) {
 
 
 // --- AsyncServer backward-compat TLS entry points (ESP32) ---
-void AsyncServer::onSslFileRequest(AcSSlFileHandler cb, void *arg) {
-  if (!_tls_server_hooks) {
-    SecureServerHooks *h = new (std::nothrow) SecureServerHooks(this);
-    if (!h) {
-      return;
-    }
-    setHooks(h);
+void AsyncServer::onSslFileRequest(std::function<int(void *arg, uint8_t **cert, uint8_t **key)> cb, void *arg) {
+  if (!_impl->hooks()) {
+    _impl->setHooks(new (std::nothrow) SecureServerHooks(_impl.get()));
   }
-  static_cast<SecureServerHooks *>(_tls_server_hooks)->onSslFileRequest(cb, arg);
+  static_cast<SecureServerHooks *>(_impl->hooks())->onSslFileRequest(cb, arg);
 }
 
 void AsyncServer::beginSecure(const char *cert, const char *key, const char *password) {
-  if (!_tls_server_hooks) {
-    SecureServerHooks *h = new (std::nothrow) SecureServerHooks(this);
-    if (!h) {
-      return;
-    }
-    setHooks(h);
+  if (!_impl->hooks()) {
+    _impl->setHooks(new (std::nothrow) SecureServerHooks(_impl.get()));
   }
-  static_cast<SecureServerHooks *>(_tls_server_hooks)->beginSecure(cert, key, password);
+  static_cast<SecureServerHooks *>(_impl->hooks())->beginSecure(cert, key, password);
 }
 #endif
 

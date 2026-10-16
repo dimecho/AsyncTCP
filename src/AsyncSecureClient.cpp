@@ -45,7 +45,7 @@ bool AsyncSecureClient::beginSecure(const char *host, uint16_t port, const char 
       (const unsigned char *)clientKey, (clientKey != NULL) ? strlen(clientKey) + 1 : 0,
       keyPassword);
 #endif
-  SecureClientHooks *hooks = new (std::nothrow) SecureClientHooks(session, this);
+  SecureClientHooks *hooks = new (std::nothrow) SecureClientHooks(session, _impl.get());
   if (!hooks) {
     delete session;
     return false;
@@ -70,7 +70,7 @@ bool AsyncSecureClient::beginSecure(const char *host, uint16_t port,
   }
   session->setClientCredentials(host, rootCA, rootCALen, clientCert, clientCertLen,
       clientKey, clientKeyLen, keyPassword);
-  SecureClientHooks *hooks = new (std::nothrow) SecureClientHooks(session, this);
+  SecureClientHooks *hooks = new (std::nothrow) SecureClientHooks(session, _impl.get());
   if (!hooks) {
     delete session;
     return false;
@@ -83,7 +83,7 @@ bool AsyncSecureClient::beginSecure(const char *host, uint16_t port,
 // --- SecureClientHooks: the session-driven data path, connected to the client
 // lifecycle by AsyncClient::setHooks() ---
 
-SecureClientHooks::SecureClientHooks(AsyncSecureSession *s, AsyncClient *c) : sess(s), client(c) {
+SecureClientHooks::SecureClientHooks(AsyncSecureSession *s, AsyncClientImpl *c) : sess(s), client(c) {
   // Route the session's callbacks into this client's app callbacks. The
   // onConnect/onData/onError the app registers on the AsyncClient fire from
   // here (the server path's onConnect fires on handshake completion,
@@ -124,7 +124,7 @@ SecureClientHooks::SecureClientHooks(AsyncSecureSession *s, AsyncClient *c) : se
 #endif
 }
 
-bool SecureClientHooks::onConnected(AsyncClient *c) {
+bool SecureClientHooks::onConnected(AsyncClientImpl *c) {
   // Start the handshake from the stored credentials. onConnect fires from the
   // session's onHandshake callback when the handshake completes.
   if (sess->startClient(c->pcb()) != 0) {
@@ -142,7 +142,7 @@ bool SecureClientHooks::onConnected(AsyncClient *c) {
 }
 
 #ifdef ESP8266
-bool SecureClientHooks::onRecv(AsyncClient *c, struct pbuf *pb) {
+bool SecureClientHooks::onRecv(AsyncClientImpl *c, struct pbuf *pb) {
   if (pb == NULL) {
     // Peer FIN: close the TLS connection (close_notify exchange) — mirror
     // the reference; the plain path uses lwIP's own fin handling instead.
@@ -163,7 +163,7 @@ bool SecureClientHooks::onRecv(AsyncClient *c, struct pbuf *pb) {
   return true;
 }
 
-bool SecureClientHooks::onSent(AsyncClient *c, uint16_t len) {
+bool SecureClientHooks::onSent(AsyncClientImpl *c, uint16_t len) {
   // TLS-layer ACK handling must run for EVERY ciphertext ACK, INCLUDING
   // mid-handshake: handshake flight records ride the same no-copy ring as
   // app data, and their slots only free here.
@@ -176,7 +176,7 @@ bool SecureClientHooks::onSent(AsyncClient *c, uint16_t len) {
   return false;
 }
 
-bool SecureClientHooks::onPoll(AsyncClient *c) {
+bool SecureClientHooks::onPoll(AsyncClientImpl *c) {
   struct tcp_pcb *pcb = c->pcb();
   if (!pcb) {
     return false;
@@ -222,7 +222,7 @@ bool SecureClientHooks::onPoll(AsyncClient *c) {
   return false;
 }
 
-int SecureClientHooks::onWrite(AsyncClient *c, const char *data, size_t size) {
+int SecureClientHooks::onWrite(AsyncClientImpl *c, const char *data, size_t size) {
   // TLS: encrypt via the session (tcp_ssl_write on the fork's TLS-aware lwIP)
   size_t room = c->space();
   size_t will_send = (room < size) ? room : size;
@@ -237,7 +237,7 @@ int SecureClientHooks::onWrite(AsyncClient *c, const char *data, size_t size) {
 // Runs on the async task (AsyncClient's pcb recv handler queues the pbuf as a
 // normal event). All TLS work — ciphertext buffer, handshake, plaintext
 // delivery — happens here and ONLY here, so the BIO buffer is single-threaded.
-bool SecureClientHooks::onRecv(AsyncClient *c, struct pbuf *pb) {
+bool SecureClientHooks::onRecv(AsyncClientImpl *c, struct pbuf *pb) {
   touchRx(c, millis());  // inbound ciphertext = liveness
   if (!pb) {
     return true;
@@ -281,13 +281,13 @@ bool SecureClientHooks::onRecv(AsyncClient *c, struct pbuf *pb) {
   return true;
 }
 
-bool SecureClientHooks::onSent(AsyncClient *c, uint16_t len) {
+bool SecureClientHooks::onSent(AsyncClientImpl *c, uint16_t len) {
   (void)c;
   (void)len;
   return false;  // app-level ACK accounting applies to TLS too
 }
 
-bool SecureClientHooks::onPoll(AsyncClient *c) {
+bool SecureClientHooks::onPoll(AsyncClientImpl *c) {
   // Handshake timeout: a wedge here pins the TLS slab; abort so peer retries.
   if (!sess->handshakeDone() && sess->handshakeTimeoutElapsed()) {
     notifyError(c, -61);
@@ -297,7 +297,7 @@ bool SecureClientHooks::onPoll(AsyncClient *c) {
   return false;
 }
 
-int SecureClientHooks::onWrite(AsyncClient *c, const char *data, size_t size) {
+int SecureClientHooks::onWrite(AsyncClientImpl *c, const char *data, size_t size) {
   (void)c;
   if (!sess->handshakeDone()) {
     return -1;
@@ -311,14 +311,14 @@ int SecureClientHooks::onWrite(AsyncClient *c, const char *data, size_t size) {
 }
 #endif // ESP8266
 
-void SecureClientHooks::onClosing(AsyncClient *c) {
+void SecureClientHooks::onClosing(AsyncClientImpl *c) {
   (void)c;
   // Release TLS state while the pcb is still live: flush pending records and
   // return the session slab.
   sess->close();
 }
 
-void SecureClientHooks::onError(AsyncClient *c, int8_t err) {
+void SecureClientHooks::onError(AsyncClientImpl *c, int8_t err) {
   (void)c;
   (void)err;
   // Transport RST: the pcb is already gone; release the session (the fork's

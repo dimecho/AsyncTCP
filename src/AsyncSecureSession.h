@@ -765,18 +765,18 @@ public:
 // AsyncSecureServer.cpp); the method bodies live in AsyncSecureClient.cpp.
 #if ASYNC_TCP_SSL_ENABLED
 struct SecureClientHooks : AsyncClientHooks {
-  SecureClientHooks(AsyncSecureSession *s, AsyncClient *c);
+  SecureClientHooks(AsyncSecureSession *s, AsyncClientImpl *c);
   ~SecureClientHooks() override { delete sess; }
 
-  bool onConnected(AsyncClient *c) override;
-  bool onRecv(AsyncClient *c, struct pbuf *pb) override;
-  bool onSent(AsyncClient *c, uint16_t len) override;
-  bool onPoll(AsyncClient *c) override;
-  int onWrite(AsyncClient *c, const char *data, size_t size) override;
-  void onClosing(AsyncClient *c) override;
-  void onError(AsyncClient *c, int8_t err) override;
+  bool onConnected(AsyncClientImpl *c) override;
+  bool onRecv(AsyncClientImpl *c, struct pbuf *pb) override;
+  bool onSent(AsyncClientImpl *c, uint16_t len) override;
+  bool onPoll(AsyncClientImpl *c) override;
+  int onWrite(AsyncClientImpl *c, const char *data, size_t size) override;
+  void onClosing(AsyncClientImpl *c) override;
+  void onError(AsyncClientImpl *c, int8_t err) override;
 
   AsyncSecureSession *sess;
-  AsyncClient *client;
+  AsyncClientImpl *client;
 };
 #endif // ASYNC_TCP_SSL_ENABLED
